@@ -655,8 +655,8 @@ pub fn parse_decimal<T: DecimalType>(
     scale: i8,
 ) -> Result<T::Native, ArrowError> {
     let mut result = T::Native::usize_as(0);
-    let mut fractionals = 0;
-    let mut digits = 0;
+    let mut fractionals: i8 = 0;
+    let mut digits: u8 = 0;
     let base = T::Native::usize_as(10);
 
     let bs = s.as_bytes();
@@ -665,6 +665,11 @@ pub fn parse_decimal<T: DecimalType>(
         Some(b'+') => (&bs[1..], false),
         _ => (bs, false),
     };
+
+    let mut reach_scale_number: i8 = -1;
+    let mut is_exp: bool = false;
+    let mut exp_pos: bool = true;
+    let mut exp: i8 = 0;
 
     if bs.is_empty() {
         return Err(ArrowError::ParseError(format!(
@@ -675,7 +680,35 @@ pub fn parse_decimal<T: DecimalType>(
     let mut bs = bs.iter();
     // Overflow checks are not required if 10^(precision - 1) <= T::MAX holds.
     // Thus, if we validate the precision correctly, we can skip overflow checks.
+    // 0.1e-6
     while let Some(b) = bs.next() {
+        if is_exp {
+            exp_pos = match b {
+                &b'-' => false,
+                &b'+' => true,
+                _ => {
+                    if !b.is_ascii_digit() {
+                        return Err(ArrowError::ParseError(format!(
+                            "can't parse the string value {s} to decimal"
+                        )));
+                    }
+                    exp = exp * 10 + (b - b'0') as i8;
+
+                    true
+                }
+            };
+            for b in bs.by_ref() {
+                if !b.is_ascii_digit() {
+                    return Err(ArrowError::ParseError(format!(
+                        "can't parse the string value {s} to decimal"
+                    )));
+                }
+                exp = exp * 10 + (b - b'0') as i8;
+            }
+
+            break;
+        }
+
         match b {
             b'0'..=b'9' => {
                 if digits == 0 && *b == b'0' {
@@ -689,28 +722,33 @@ pub fn parse_decimal<T: DecimalType>(
             b'.' => {
                 for b in bs.by_ref() {
                     if !b.is_ascii_digit() {
+                        if *b == b'e' || *b == b'E' {
+                            is_exp = true;
+                            break;
+                        }
+
                         return Err(ArrowError::ParseError(format!(
                             "can't parse the string value {s} to decimal"
                         )));
                     }
+
                     if fractionals == scale {
-                        // We have processed all the digits that we need. All that
-                        // is left is to validate that the rest of the string contains
-                        // valid digits.
-                        continue;
+                        reach_scale_number = fractionals;
                     }
                     fractionals += 1;
                     digits += 1;
                     result = result.mul_wrapping(base);
                     result = result.add_wrapping(T::Native::usize_as((b - b'0') as usize));
                 }
-
                 // Fail on "."
                 if digits == 0 {
                     return Err(ArrowError::ParseError(format!(
                         "can't parse the string value {s} to decimal"
                     )));
                 }
+            }
+            b'e' | b'E' => {
+                is_exp = true;
             }
             _ => {
                 return Err(ArrowError::ParseError(format!(
@@ -720,15 +758,38 @@ pub fn parse_decimal<T: DecimalType>(
         }
     }
 
+    if is_exp {
+        if !exp_pos {
+            exp *= -1
+        }
+        exp = scale - (fractionals - exp);
+        if exp < 0 {
+            exp_pos = false;
+            exp *= -1;
+        }
+    } else {
+        if fractionals < scale {
+            exp = scale - fractionals;
+        }
+        if reach_scale_number > -1 {
+            result =
+                result.div_wrapping(base.pow_wrapping((fractionals - reach_scale_number) as _));
+            digits -= (fractionals - reach_scale_number) as u8;
+        }
+    }
+
     if fractionals < scale {
-        let exp = scale - fractionals;
         if exp as u8 + digits > precision {
             return Err(ArrowError::ParseError("parse decimal overflow".to_string()));
         }
-        let mul = base.pow_wrapping(exp as _);
-        result = result.mul_wrapping(mul);
     } else if digits > precision {
         return Err(ArrowError::ParseError("parse decimal overflow".to_string()));
+    }
+
+    if exp_pos {
+        result = result.mul_wrapping(base.pow_wrapping(exp as _));
+    } else {
+        result = result.div_wrapping(base.pow_wrapping(exp as _));
     }
 
     Ok(if negative {
@@ -2240,7 +2301,7 @@ mod tests {
                 i256::from_string(
                     "9999999999999999999999999999999999999999999999999999999999999999999999999999",
                 )
-                .unwrap(),
+                    .unwrap(),
                 0,
             ),
             (
@@ -2248,7 +2309,7 @@ mod tests {
                 i256::from_string(
                     "9999999999999999999999999999999999999999999999999999999999999999999999999999",
                 )
-                .unwrap(),
+                    .unwrap(),
                 4,
             ),
             (
@@ -2256,7 +2317,7 @@ mod tests {
                 i256::from_string(
                     "9999999999999999999999999999999999999999999999999999999999999999999999999999",
                 )
-                .unwrap(),
+                    .unwrap(),
                 26,
             ),
             (
@@ -2264,13 +2325,37 @@ mod tests {
                 i256::from_string(
                     "9999999999999999999999999999999999999999999999999900000000000000000000000000",
                 )
-                .unwrap(),
+                    .unwrap(),
                 26,
             ),
         ];
         for (s, i, scale) in edge_tests_256 {
             let result = parse_decimal::<Decimal256Type>(s, 76, scale);
             assert_eq!(i, result.unwrap());
+        }
+        let e_notation_tests = [
+            ("1.23e3", "1230.0", 2),
+            ("5.6714e+2", "567.14", 4),
+            ("5.6714e-2", "0.056714", 4),
+            ("5.6714e-2", "0.056714", 3),
+            ("5.6741214125e2", "567.41214125", 4),
+            ("8.91E4", "89100.0", 2),
+            ("3.14E+5", "314000.0", 2),
+            ("2.718e0", "2.718", 2),
+            ("9.999999e-1", "0.9999999", 4),
+            ("1.00E-10", "0.0000000001", 11),
+            ("1.23e-4", "0.000123", 2),
+            ("9.876e7", "98760000.0", 2),
+            ("5.432E+8", "543200000.0", 10),
+            ("1.234567e9", "1234567000.0", 2),
+        ];
+        for (e, d, scale) in e_notation_tests {
+            let result_128_e = parse_decimal::<Decimal128Type>(e, 20, scale);
+            let result_128_d = parse_decimal::<Decimal128Type>(d, 20, scale);
+            assert_eq!(result_128_e.unwrap(), result_128_d.unwrap());
+            let result_256_e = parse_decimal::<Decimal256Type>(e, 20, scale);
+            let result_256_d = parse_decimal::<Decimal256Type>(d, 20, scale);
+            assert_eq!(result_256_e.unwrap(), result_256_d.unwrap());
         }
     }
 }
