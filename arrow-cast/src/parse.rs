@@ -24,7 +24,6 @@ use chrono::prelude::*;
 use half::f16;
 use std::str::FromStr;
 
-
 /// Parse nanoseconds from the first `N` values in digits, subtracting the offset `O`
 #[inline]
 fn parse_nanos<const N: usize, const O: u8>(digits: &[u8]) -> u32 {
@@ -731,7 +730,7 @@ pub fn parse_decimal<T: DecimalType>(
                 exp = exp * 10 + (b - b'0') as i8;
             }
 
-            break
+            break;
         }
 
         match b {
@@ -792,13 +791,13 @@ pub fn parse_decimal<T: DecimalType>(
             exp_pos = false;
             exp *= -1;
         }
-
     } else {
         if fractionals < scale {
             exp = scale - fractionals;
         }
         if reach_scale_number > -1 {
-            result = result.div_wrapping(base.pow_wrapping((fractionals - reach_scale_number) as _));
+            result =
+                result.div_wrapping(base.pow_wrapping((fractionals - reach_scale_number) as _));
             digits -= (fractionals - reach_scale_number) as u8;
         }
     }
@@ -938,39 +937,39 @@ impl FromStr for IntervalAmount {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.split_once('.') {
             Some((integer, frac))
-            if frac.len() <= INTERVAL_PRECISION as usize
-                && !frac.is_empty()
-                && !frac.starts_with('-') =>
-                {
-                    // integer will be "" for values like ".5"
-                    // and "-" for values like "-.5"
-                    let explicit_neg = integer.starts_with('-');
-                    let integer = if integer.is_empty() || integer == "-" {
-                        Ok(0)
-                    } else {
-                        integer.parse::<i64>().map_err(|_| {
-                            ArrowError::ParseError(format!("Failed to parse {s} as interval amount"))
-                        })
-                    }?;
-
-                    let frac_unscaled = frac.parse::<i64>().map_err(|_| {
+                if frac.len() <= INTERVAL_PRECISION as usize
+                    && !frac.is_empty()
+                    && !frac.starts_with('-') =>
+            {
+                // integer will be "" for values like ".5"
+                // and "-" for values like "-.5"
+                let explicit_neg = integer.starts_with('-');
+                let integer = if integer.is_empty() || integer == "-" {
+                    Ok(0)
+                } else {
+                    integer.parse::<i64>().map_err(|_| {
                         ArrowError::ParseError(format!("Failed to parse {s} as interval amount"))
-                    })?;
+                    })
+                }?;
 
-                    // scale fractional part by interval precision
-                    let frac = frac_unscaled * 10_i64.pow(INTERVAL_PRECISION - frac.len() as u32);
+                let frac_unscaled = frac.parse::<i64>().map_err(|_| {
+                    ArrowError::ParseError(format!("Failed to parse {s} as interval amount"))
+                })?;
 
-                    // propagate the sign of the integer part to the fractional part
-                    let frac = if integer < 0 || explicit_neg {
-                        -frac
-                    } else {
-                        frac
-                    };
+                // scale fractional part by interval precision
+                let frac = frac_unscaled * 10_i64.pow(INTERVAL_PRECISION - frac.len() as u32);
 
-                    let result = Self { integer, frac };
+                // propagate the sign of the integer part to the fractional part
+                let frac = if integer < 0 || explicit_neg {
+                    -frac
+                } else {
+                    frac
+                };
 
-                    Ok(result)
-                }
+                let result = Self { integer, frac };
+
+                Ok(result)
+            }
             Some((_, frac)) if frac.starts_with('-') => Err(ArrowError::ParseError(format!(
                 "Failed to parse {s} as interval amount"
             ))),
@@ -1366,7 +1365,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2020, 9, 8).unwrap(),
             NaiveTime::from_hms_opt(13, 42, 29).unwrap(),
         )
-            .and_utc();
+        .and_utc();
 
         // Ensure both T and ' ' variants work
         assert_eq!(
@@ -1386,7 +1385,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2020, 9, 8).unwrap(),
             NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
         )
-            .and_utc();
+        .and_utc();
 
         assert_eq!(
             datetime_no_time.timestamp_nanos_opt().unwrap(),
@@ -2335,7 +2334,7 @@ mod tests {
                 i256::from_string(
                     "9999999999999999999999999999999999999999999999999999999999999999999999999999",
                 )
-                    .unwrap(),
+                .unwrap(),
                 0,
             ),
             (
@@ -2343,7 +2342,7 @@ mod tests {
                 i256::from_string(
                     "9999999999999999999999999999999999999999999999999999999999999999999999999999",
                 )
-                    .unwrap(),
+                .unwrap(),
                 4,
             ),
             (
@@ -2351,7 +2350,7 @@ mod tests {
                 i256::from_string(
                     "9999999999999999999999999999999999999999999999999999999999999999999999999999",
                 )
-                    .unwrap(),
+                .unwrap(),
                 26,
             ),
             (
@@ -2359,7 +2358,7 @@ mod tests {
                 i256::from_string(
                     "9999999999999999999999999999999999999999999999999900000000000000000000000000",
                 )
-                    .unwrap(),
+                .unwrap(),
                 26,
             ),
         ];
@@ -2391,7 +2390,6 @@ mod tests {
             let result_256_d = parse_decimal::<Decimal256Type>(d, 20, scale);
             assert_eq!(result_256_e.unwrap(), result_256_d.unwrap());
         }
-
     }
 
     #[test]
