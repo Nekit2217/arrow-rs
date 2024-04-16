@@ -64,7 +64,18 @@ where
                     let value = parse_decimal::<D>(s, self.precision, self.scale)?;
                     builder.append_value(value)
                 }
-                _ => return Err(tape.error(*p, "decimal")),
+                TapeElement::F32(val) => {
+                    let value = parse_decimal::<D>(&f32::from_bits(val).to_string(), self.precision, self.scale)?;
+                    builder.append_value(value);
+                }
+                TapeElement::F64(high) => {
+                    let f_hight = f64::from_bits((high as u64) << 32);
+                    let value = parse_decimal::<D>(format!("{:.45}", f_hight).as_ref(), self.precision, self.scale)?;
+                    builder.append_value(value)
+                },
+                _ => {
+                    return Err(tape.error(*p, "decimal"))
+                },
             }
         }
 
