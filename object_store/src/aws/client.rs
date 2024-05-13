@@ -317,7 +317,8 @@ pub(crate) struct S3Client {
 
 impl S3Client {
     pub fn new(config: S3Config) -> Result<Self> {
-        let client = config.client_options.client()?;
+        // let client = config.client_options.clone().client()?;
+        let client = config.client_options.clone().with_connect_timeout_disabled().with_timeout_disabled().client()?;
         Ok(Self { config, client })
     }
 

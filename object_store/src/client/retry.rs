@@ -178,8 +178,8 @@ pub trait RetryExt {
 impl RetryExt for reqwest::RequestBuilder {
     fn send_retry(self, config: &RetryConfig) -> BoxFuture<'static, Result<Response>> {
         let mut backoff = Backoff::new(&config.backoff);
-        let max_retries = config.max_retries;
-        let retry_timeout = config.retry_timeout;
+        let max_retries = 20; //config.max_retries;
+        let retry_timeout = Duration::from_secs(20 * 60); // config.retry_timeout;
 
         let (client, req) = self.build_split();
         let req = req.expect("request must be valid");
