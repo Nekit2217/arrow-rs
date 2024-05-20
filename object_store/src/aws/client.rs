@@ -54,6 +54,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::sync::Arc;
+use std::time::Duration;
 
 const VERSION_HEADER: &str = "x-amz-version-id";
 
@@ -318,7 +319,13 @@ pub(crate) struct S3Client {
 impl S3Client {
     pub fn new(config: S3Config) -> Result<Self> {
         // let client = config.client_options.clone().client()?;
-        let client = config.client_options.clone().with_connect_timeout_disabled().with_timeout_disabled().client()?;
+        let client = config.client_options.clone()
+            .with_connect_timeout_disabled()
+            .with_timeout_disabled()
+            // .with_http2_keep_alive_while_idle()
+            // .with_http2_keep_alive_interval(Duration::from_secs(15))
+            // .with_http2_keep_alive_timeout(Duration::from_secs(20))
+            .client()?;
         Ok(Self { config, client })
     }
 
