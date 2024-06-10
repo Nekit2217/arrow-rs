@@ -78,7 +78,7 @@ impl<O: OffsetSizeTrait> ArrayDecoder for StringArrayDecoder<O> {
 
         if O::from_usize(data_capacity).is_none() {
             return Err(ArrowError::JsonError(format!(
-                "offset overflow decoding {}",
+                "string_array offset overflow decoding {}",
                 GenericStringArray::<O>::DATA_TYPE
             )));
         }
