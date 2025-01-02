@@ -104,11 +104,11 @@ use crate::bloom_filter::{
 };
 use crate::column::page::{PageIterator, PageReader};
 use crate::errors::{ParquetError, Result};
-use crate::file::footer::{decode_footer, decode_metadata};
-use crate::file::metadata::{ParquetMetaData, RowGroupMetaData};
+use crate::file::metadata::{ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData};
+use crate::file::page_index::offset_index::OffsetIndexMetaData;
 use crate::file::reader::{ChunkReader, Length, SerializedPageReader};
 use crate::file::FOOTER_SIZE;
-use crate::format::{BloomFilterAlgorithm, BloomFilterCompression, BloomFilterHash, PageLocation};
+use crate::format::{BloomFilterAlgorithm, BloomFilterCompression, BloomFilterHash};
 
 mod metadata;
 pub use metadata::*;
@@ -121,6 +121,18 @@ use crate::arrow::schema::ParquetField;
 pub use store::*;
 
 /// The asynchronous interface used by [`ParquetRecordBatchStream`] to read parquet files
+///
+/// Notes:
+///
+/// 1. There is a default implementation for types that implement [`AsyncRead`]
+///    and [`AsyncSeek`], for example [`tokio::fs::File`].
+///
+/// 2. [`ParquetObjectReader`], available when the `object_store` crate feature
+///    is enabled, implements this interface for [`ObjectStore`].
+///
+/// [`ObjectStore`]: object_store::ObjectStore
+///
+/// [`tokio::fs::File`]: https://docs.rs/tokio/latest/tokio/fs/struct.File.html
 pub trait AsyncFileReader: Send {
     /// Retrieve the bytes in `range`
     fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>>;
@@ -185,14 +197,14 @@ impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncFileReader for T {
             let mut buf = [0_u8; FOOTER_SIZE];
             self.read_exact(&mut buf).await?;
 
-            let metadata_len = decode_footer(&buf)?;
+            let metadata_len = ParquetMetaDataReader::decode_footer(&buf)?;
             self.seek(SeekFrom::End(-FOOTER_SIZE_I64 - metadata_len as i64))
                 .await?;
 
             let mut buf = Vec::with_capacity(metadata_len);
             self.take(metadata_len as _).read_to_end(&mut buf).await?;
 
-            Ok(Arc::new(decode_metadata(&buf)?))
+            Ok(Arc::new(ParquetMetaDataReader::decode_metadata(&buf)?))
         }
         .boxed()
     }
@@ -212,6 +224,8 @@ impl ArrowReaderMetadata {
         input: &mut T,
         options: ArrowReaderOptions,
     ) -> Result<Self> {
+        // TODO: this is all rather awkward. It would be nice if AsyncFileReader::get_metadata
+        // took an argument to fetch the page indexes.
         let mut metadata = input.get_metadata().await?;
 
         if options.page_index
@@ -219,9 +233,9 @@ impl ArrowReaderMetadata {
             && metadata.offset_index().is_none()
         {
             let m = Arc::try_unwrap(metadata).unwrap_or_else(|e| e.as_ref().clone());
-            let mut loader = MetadataLoader::new(input, m);
-            loader.load_page_index(true, true).await?;
-            metadata = Arc::new(loader.finish())
+            let mut reader = ParquetMetaDataReader::new_with_metadata(m).with_page_indexes(true);
+            reader.load_page_index(input).await?;
+            metadata = Arc::new(reader.finish()?)
         }
         Self::try_new(metadata, options)
     }
@@ -489,9 +503,11 @@ where
         // TODO: calling build_array multiple times is wasteful
 
         let meta = self.metadata.row_group(row_group_idx);
-        let page_locations = self
+        let offset_index = self
             .metadata
             .offset_index()
+            // filter out empty offset indexes (old versions specified Some(vec![]) when no present)
+            .filter(|index| !index.is_empty())
             .map(|x| x[row_group_idx].as_slice());
 
         let mut row_group = InMemoryRowGroup {
@@ -499,7 +515,7 @@ where
             // schema: meta.schema_descr_ptr(),
             row_count: meta.num_rows() as usize,
             column_chunks: vec![None; meta.columns().len()],
-            page_locations,
+            offset_index,
         };
 
         if let Some(filter) = self.filter.as_mut() {
@@ -703,7 +719,7 @@ where
 /// An in-memory collection of column chunks
 struct InMemoryRowGroup<'a> {
     metadata: &'a RowGroupMetaData,
-    page_locations: Option<&'a [Vec<PageLocation>]>,
+    offset_index: Option<&'a [OffsetIndexMetaData]>,
     column_chunks: Vec<Option<Arc<ColumnChunkData>>>,
     row_count: usize,
 }
@@ -716,7 +732,7 @@ impl<'a> InMemoryRowGroup<'a> {
         projection: &ProjectionMask,
         selection: Option<&RowSelection>,
     ) -> Result<()> {
-        if let Some((selection, page_locations)) = selection.zip(self.page_locations) {
+        if let Some((selection, offset_index)) = selection.zip(self.offset_index) {
             // If we have a `RowSelection` and an `OffsetIndex` then only fetch pages required for the
             // `RowSelection`
             let mut page_start_offsets: Vec<Vec<usize>> = vec![];
@@ -734,14 +750,14 @@ impl<'a> InMemoryRowGroup<'a> {
                     // then we need to also fetch a dictionary page.
                     let mut ranges = vec![];
                     let (start, _len) = chunk_meta.byte_range();
-                    match page_locations[idx].first() {
+                    match offset_index[idx].page_locations.first() {
                         Some(first) if first.offset as u64 != start => {
                             ranges.push(start as usize..first.offset as usize);
                         }
                         _ => (),
                     }
 
-                    ranges.extend(selection.scan_ranges(&page_locations[idx]));
+                    ranges.extend(selection.scan_ranges(&offset_index[idx].page_locations));
                     page_start_offsets.push(ranges.iter().map(|range| range.start).collect());
 
                     ranges
@@ -801,7 +817,7 @@ impl<'a> InMemoryRowGroup<'a> {
     }
 }
 
-impl<'a> RowGroups for InMemoryRowGroup<'a> {
+impl RowGroups for InMemoryRowGroup<'_> {
     fn num_rows(&self) -> usize {
         self.row_count
     }
@@ -812,7 +828,11 @@ impl<'a> RowGroups for InMemoryRowGroup<'a> {
                 "Invalid column index {i}, column was not fetched"
             ))),
             Some(data) => {
-                let page_locations = self.page_locations.map(|index| index[i].clone());
+                let page_locations = self
+                    .offset_index
+                    // filter out empty offset indexes (old versions specified Some(vec![]) when no present)
+                    .filter(|index| !index.is_empty())
+                    .map(|index| index[i].page_locations.clone());
                 let page_reader: Box<dyn PageReader> = Box::new(SerializedPageReader::new(
                     data.clone(),
                     self.metadata.column(i),
@@ -906,7 +926,7 @@ mod tests {
     };
     use crate::arrow::schema::parquet_to_arrow_schema_and_fields;
     use crate::arrow::ArrowWriter;
-    use crate::file::footer::parse_metadata;
+    use crate::file::metadata::ParquetMetaDataReader;
     use crate::file::page_index::index_reader;
     use crate::file::properties::WriterProperties;
     use arrow::compute::kernels::cmp::eq;
@@ -949,7 +969,9 @@ mod tests {
         let path = format!("{testdata}/alltypes_plain.parquet");
         let data = Bytes::from(std::fs::read(path).unwrap());
 
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let metadata = Arc::new(metadata);
 
         assert_eq!(metadata.num_row_groups(), 1);
@@ -1004,7 +1026,9 @@ mod tests {
         let path = format!("{testdata}/alltypes_tiny_pages_plain.parquet");
         let data = Bytes::from(std::fs::read(path).unwrap());
 
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let metadata = Arc::new(metadata);
 
         assert_eq!(metadata.num_row_groups(), 1);
@@ -1070,7 +1094,9 @@ mod tests {
         let path = format!("{testdata}/alltypes_tiny_pages_plain.parquet");
         let data = Bytes::from(std::fs::read(path).unwrap());
 
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let metadata = Arc::new(metadata);
 
         assert_eq!(metadata.num_row_groups(), 1);
@@ -1114,7 +1140,9 @@ mod tests {
         let path = format!("{testdata}/alltypes_tiny_pages_plain.parquet");
         let data = Bytes::from(std::fs::read(path).unwrap());
 
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let metadata = Arc::new(metadata);
 
         assert_eq!(metadata.num_row_groups(), 1);
@@ -1170,7 +1198,9 @@ mod tests {
         let path = format!("{testdata}/alltypes_tiny_pages_plain.parquet");
         let data = Bytes::from(std::fs::read(path).unwrap());
 
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let metadata = Arc::new(metadata);
 
         assert_eq!(metadata.num_row_groups(), 1);
@@ -1235,7 +1265,9 @@ mod tests {
         let path = format!("{testdata}/alltypes_tiny_pages_plain.parquet");
         let data = Bytes::from(std::fs::read(path).unwrap());
 
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let metadata = Arc::new(metadata);
 
         assert_eq!(metadata.num_row_groups(), 1);
@@ -1314,7 +1346,9 @@ mod tests {
         writer.close().unwrap();
 
         let data: Bytes = buf.into();
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let parquet_schema = metadata.file_metadata().schema_descr_ptr();
 
         let test = TestReader {
@@ -1388,7 +1422,9 @@ mod tests {
         writer.close().unwrap();
 
         let data: Bytes = buf.into();
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
 
         assert_eq!(metadata.num_row_groups(), 2);
 
@@ -1476,7 +1512,9 @@ mod tests {
         let path = format!("{testdata}/alltypes_tiny_pages_plain.parquet");
         let data = Bytes::from(std::fs::read(path).unwrap());
 
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let parquet_schema = metadata.file_metadata().schema_descr_ptr();
         let metadata = Arc::new(metadata);
 
@@ -1526,19 +1564,24 @@ mod tests {
         let path = format!("{testdata}/alltypes_tiny_pages.parquet");
         let data = Bytes::from(std::fs::read(path).unwrap());
 
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
 
         let offset_index =
-            index_reader::read_pages_locations(&data, metadata.row_group(0).columns())
+            index_reader::read_offset_indexes(&data, metadata.row_group(0).columns())
                 .expect("reading offset index");
 
-        let row_group_meta = metadata.row_group(0).clone();
-        let metadata = ParquetMetaData::new_with_page_index(
-            metadata.file_metadata().clone(),
-            vec![row_group_meta],
-            None,
-            Some(vec![offset_index.clone()]),
-        );
+        let mut metadata_builder = metadata.into_builder();
+        let mut row_groups = metadata_builder.take_row_groups();
+        row_groups.truncate(1);
+        let row_group_meta = row_groups.pop().unwrap();
+
+        let metadata = metadata_builder
+            .add_row_group(row_group_meta)
+            .set_column_index(None)
+            .set_offset_index(Some(vec![offset_index.clone()]))
+            .build();
 
         let metadata = Arc::new(metadata);
 
@@ -1574,7 +1617,7 @@ mod tests {
         };
 
         let mut skip = true;
-        let mut pages = offset_index[0].iter().peekable();
+        let mut pages = offset_index[0].page_locations.iter().peekable();
 
         // Setup `RowSelection` so that we can skip every other page, selecting the last page
         let mut selectors = vec![];
@@ -1616,7 +1659,9 @@ mod tests {
         let path = format!("{testdata}/alltypes_plain.parquet");
         let data = Bytes::from(std::fs::read(path).unwrap());
 
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let file_rows = metadata.file_metadata().num_rows() as usize;
         let metadata = Arc::new(metadata);
 
@@ -1650,7 +1695,7 @@ mod tests {
     #[tokio::test]
     async fn test_parquet_record_batch_stream_schema() {
         fn get_all_field_names(schema: &Schema) -> Vec<&String> {
-            schema.all_fields().iter().map(|f| f.name()).collect()
+            schema.flattened_fields().iter().map(|f| f.name()).collect()
         }
 
         // ParquetRecordBatchReaderBuilder::schema differs from
@@ -1761,7 +1806,9 @@ mod tests {
         let testdata = arrow::util::test_util::parquet_test_data();
         let path = format!("{testdata}/data_index_bloom_encoding_stats.parquet");
         let data = Bytes::from(std::fs::read(path).unwrap());
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let metadata = Arc::new(metadata);
         let async_reader = TestReader {
             data: data.clone(),
@@ -1790,7 +1837,9 @@ mod tests {
     }
 
     async fn test_get_row_group_column_bloom_filter(data: Bytes, with_length: bool) {
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let metadata = Arc::new(metadata);
 
         assert_eq!(metadata.num_row_groups(), 1);
@@ -1930,7 +1979,9 @@ mod tests {
         writer.close().unwrap();
 
         let data: Bytes = buf.into();
-        let metadata = parse_metadata(&data).unwrap();
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&data)
+            .unwrap();
         let parquet_schema = metadata.file_metadata().schema_descr_ptr();
 
         let test = TestReader {
@@ -1989,5 +2040,106 @@ mod tests {
 
         // Should only have made 3 requests
         assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn empty_offset_index_doesnt_panic_in_read_row_group() {
+        use tokio::fs::File;
+        let testdata = arrow::util::test_util::parquet_test_data();
+        let path = format!("{testdata}/alltypes_plain.parquet");
+        let mut file = File::open(&path).await.unwrap();
+        let file_size = file.metadata().await.unwrap().len();
+        let mut metadata = ParquetMetaDataReader::new()
+            .with_page_indexes(true)
+            .load_and_finish(&mut file, file_size as usize)
+            .await
+            .unwrap();
+
+        metadata.set_offset_index(Some(vec![]));
+        let options = ArrowReaderOptions::new().with_page_index(true);
+        let arrow_reader_metadata = ArrowReaderMetadata::try_new(metadata.into(), options).unwrap();
+        let reader =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(file, arrow_reader_metadata)
+                .build()
+                .unwrap();
+
+        let result = reader.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_empty_offset_index_doesnt_panic_in_read_row_group() {
+        use tokio::fs::File;
+        let testdata = arrow::util::test_util::parquet_test_data();
+        let path = format!("{testdata}/alltypes_tiny_pages.parquet");
+        let mut file = File::open(&path).await.unwrap();
+        let file_size = file.metadata().await.unwrap().len();
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_indexes(true)
+            .load_and_finish(&mut file, file_size as usize)
+            .await
+            .unwrap();
+
+        let options = ArrowReaderOptions::new().with_page_index(true);
+        let arrow_reader_metadata = ArrowReaderMetadata::try_new(metadata.into(), options).unwrap();
+        let reader =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(file, arrow_reader_metadata)
+                .build()
+                .unwrap();
+
+        let result = reader.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(result.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn empty_offset_index_doesnt_panic_in_column_chunks() {
+        use tempfile::TempDir;
+        use tokio::fs::File;
+        fn write_metadata_to_local_file(
+            metadata: ParquetMetaData,
+            file: impl AsRef<std::path::Path>,
+        ) {
+            use crate::file::metadata::ParquetMetaDataWriter;
+            use std::fs::File;
+            let file = File::create(file).unwrap();
+            ParquetMetaDataWriter::new(file, &metadata)
+                .finish()
+                .unwrap()
+        }
+
+        fn read_metadata_from_local_file(file: impl AsRef<std::path::Path>) -> ParquetMetaData {
+            use std::fs::File;
+            let file = File::open(file).unwrap();
+            ParquetMetaDataReader::new()
+                .with_page_indexes(true)
+                .parse_and_finish(&file)
+                .unwrap()
+        }
+
+        let testdata = arrow::util::test_util::parquet_test_data();
+        let path = format!("{testdata}/alltypes_plain.parquet");
+        let mut file = File::open(&path).await.unwrap();
+        let file_size = file.metadata().await.unwrap().len();
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_indexes(true)
+            .load_and_finish(&mut file, file_size as usize)
+            .await
+            .unwrap();
+
+        let tempdir = TempDir::new().unwrap();
+        let metadata_path = tempdir.path().join("thrift_metadata.dat");
+        write_metadata_to_local_file(metadata, &metadata_path);
+        let metadata = read_metadata_from_local_file(&metadata_path);
+
+        let options = ArrowReaderOptions::new().with_page_index(true);
+        let arrow_reader_metadata = ArrowReaderMetadata::try_new(metadata.into(), options).unwrap();
+        let reader =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(file, arrow_reader_metadata)
+                .build()
+                .unwrap();
+
+        // Panics here
+        let result = reader.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(result.len(), 1);
     }
 }

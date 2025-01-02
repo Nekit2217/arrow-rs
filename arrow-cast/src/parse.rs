@@ -285,12 +285,12 @@ fn to_timestamp_nanos(dt: NaiveDateTime) -> Result<i64, ArrowError> {
 /// variants and converts it to nanoseconds since midnight.
 ///
 /// Examples of accepted inputs:
+///
 /// * `09:26:56.123 AM`
 /// * `23:59:59`
 /// * `6:00 pm`
-//
-/// Internally, this function uses the `chrono` library for the
-/// time parsing
+///
+/// Internally, this function uses the `chrono` library for the time parsing
 ///
 /// ## Timezone / Offset Handling
 ///
@@ -432,8 +432,12 @@ fn string_to_time(s: &str) -> Option<NaiveTime> {
 /// assert_eq!(ts, 1609459200123456789);
 /// ```
 pub trait Parser: ArrowPrimitiveType {
+    /// Parse a string to the native type
     fn parse(string: &str) -> Option<Self::Native>;
 
+    /// Parse a string to the native type with a format string
+    ///
+    /// When not implemented, the format string is unused, and this method is equivalent to [parse](#tymethod.parse)
     fn parse_formatted(string: &str, _format: &str) -> Option<Self::Native> {
         Self::parse(string)
     }
@@ -493,6 +497,10 @@ parser_primitive!(Int64Type);
 parser_primitive!(Int32Type);
 parser_primitive!(Int16Type);
 parser_primitive!(Int8Type);
+parser_primitive!(DurationNanosecondType);
+parser_primitive!(DurationMicrosecondType);
+parser_primitive!(DurationMillisecondType);
+parser_primitive!(DurationSecondType);
 
 impl Parser for TimestampNanosecondType {
     fn parse(string: &str) -> Option<i64> {
@@ -837,19 +845,20 @@ pub fn parse_decimal<T: DecimalType>(
     let base = T::Native::usize_as(10);
 
     let bs = s.as_bytes();
-    let (bs, negative) = match bs.first() {
-        Some(b'-') => (&bs[1..], true),
-        Some(b'+') => (&bs[1..], false),
-        _ => (bs, false),
+    let (signed, negative) = match bs.first() {
+        Some(b'-') => (true, true),
+        Some(b'+') => (true, false),
+        _ => (false, false),
     };
 
-    if bs.is_empty() {
+    if bs.is_empty() || signed && bs.len() == 1 {
         return Err(ArrowError::ParseError(format!(
             "can't parse the string value {s} to decimal"
         )));
     }
 
-    let mut bs = bs.iter().enumerate();
+    // Iterate over the raw input bytes, skipping the sign if any
+    let mut bs = bs.iter().enumerate().skip(signed as usize);
 
     let mut is_e_notation = false;
 
@@ -966,6 +975,7 @@ pub fn parse_decimal<T: DecimalType>(
     })
 }
 
+/// Parse human-readable interval string to Arrow [IntervalYearMonthType]
 pub fn parse_interval_year_month(
     value: &str,
 ) -> Result<<IntervalYearMonthType as ArrowPrimitiveType>::Native, ArrowError> {
@@ -981,6 +991,7 @@ pub fn parse_interval_year_month(
     Ok(IntervalYearMonthType::make_value(0, months))
 }
 
+/// Parse human-readable interval string to Arrow [IntervalDayTimeType]
 pub fn parse_interval_day_time(
     value: &str,
 ) -> Result<<IntervalDayTimeType as ArrowPrimitiveType>::Native, ArrowError> {
@@ -994,15 +1005,23 @@ pub fn parse_interval_day_time(
     Ok(IntervalDayTimeType::make_value(days, millis))
 }
 
-pub fn parse_interval_month_day_nano(
+/// Parse human-readable interval string to Arrow [IntervalMonthDayNanoType]
+pub fn parse_interval_month_day_nano_config(
     value: &str,
+    config: IntervalParseConfig,
 ) -> Result<<IntervalMonthDayNanoType as ArrowPrimitiveType>::Native, ArrowError> {
-    let config = IntervalParseConfig::new(IntervalUnit::Month);
     let interval = Interval::parse(value, &config)?;
 
     let (months, days, nanos) = interval.to_month_day_nanos();
 
     Ok(IntervalMonthDayNanoType::make_value(months, days, nanos))
+}
+
+/// Parse human-readable interval string to Arrow [IntervalMonthDayNanoType]
+pub fn parse_interval_month_day_nano(
+    value: &str,
+) -> Result<<IntervalMonthDayNanoType as ArrowPrimitiveType>::Native, ArrowError> {
+    parse_interval_month_day_nano_config(value, IntervalParseConfig::new(IntervalUnit::Month))
 }
 
 const NANOS_PER_MILLIS: i64 = 1_000_000;
@@ -1012,48 +1031,100 @@ const NANOS_PER_HOUR: i64 = 60 * NANOS_PER_MINUTE;
 #[cfg(test)]
 const NANOS_PER_DAY: i64 = 24 * NANOS_PER_HOUR;
 
+/// Config to parse interval strings
+///
+/// Currently stores the `default_unit` to use if the string doesn't have one specified
+#[derive(Debug, Clone)]
+pub struct IntervalParseConfig {
+    /// The default unit to use if none is specified
+    /// e.g. `INTERVAL 1` represents `INTERVAL 1 SECOND` when default_unit = [IntervalUnit::Second]
+    default_unit: IntervalUnit,
+}
+
+impl IntervalParseConfig {
+    /// Create a new [IntervalParseConfig] with the given default unit
+    pub fn new(default_unit: IntervalUnit) -> Self {
+        Self { default_unit }
+    }
+}
+
 #[rustfmt::skip]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[repr(u16)]
-enum IntervalUnit {
+/// Represents the units of an interval, with each variant
+/// corresponding to a bit in the interval's bitfield representation
+pub enum IntervalUnit {
+    /// A Century
     Century     = 0b_0000_0000_0001,
+    /// A Decade
     Decade      = 0b_0000_0000_0010,
+    /// A Year
     Year        = 0b_0000_0000_0100,
+    /// A Month
     Month       = 0b_0000_0000_1000,
+    /// A Week
     Week        = 0b_0000_0001_0000,
+    /// A Day
     Day         = 0b_0000_0010_0000,
+    /// An Hour
     Hour        = 0b_0000_0100_0000,
+    /// A Minute
     Minute      = 0b_0000_1000_0000,
+    /// A Second
     Second      = 0b_0001_0000_0000,
+    /// A Millisecond
     Millisecond = 0b_0010_0000_0000,
+    /// A Microsecond
     Microsecond = 0b_0100_0000_0000,
+    /// A Nanosecond
     Nanosecond  = 0b_1000_0000_0000,
 }
 
+/// Logic for parsing interval unit strings
+///
+/// See <https://github.com/postgres/postgres/blob/2caa85f4aae689e6f6721d7363b4c66a2a6417d6/src/backend/utils/adt/datetime.c#L189>
+/// for a list of unit names supported by PostgreSQL which we try to match here.
 impl FromStr for IntervalUnit {
     type Err = ArrowError;
 
     fn from_str(s: &str) -> Result<Self, ArrowError> {
         match s.to_lowercase().as_str() {
-            "century" | "centuries" => Ok(Self::Century),
-            "decade" | "decades" => Ok(Self::Decade),
-            "year" | "years" => Ok(Self::Year),
-            "month" | "months" => Ok(Self::Month),
-            "week" | "weeks" => Ok(Self::Week),
-            "day" | "days" => Ok(Self::Day),
-            "hour" | "hours" => Ok(Self::Hour),
-            "minute" | "minutes" => Ok(Self::Minute),
-            "second" | "seconds" => Ok(Self::Second),
-            "millisecond" | "milliseconds" => Ok(Self::Millisecond),
-            "microsecond" | "microseconds" => Ok(Self::Microsecond),
+            "c" | "cent" | "cents" | "century" | "centuries" => Ok(Self::Century),
+            "dec" | "decs" | "decade" | "decades" => Ok(Self::Decade),
+            "y" | "yr" | "yrs" | "year" | "years" => Ok(Self::Year),
+            "mon" | "mons" | "month" | "months" => Ok(Self::Month),
+            "w" | "week" | "weeks" => Ok(Self::Week),
+            "d" | "day" | "days" => Ok(Self::Day),
+            "h" | "hr" | "hrs" | "hour" | "hours" => Ok(Self::Hour),
+            "m" | "min" | "mins" | "minute" | "minutes" => Ok(Self::Minute),
+            "s" | "sec" | "secs" | "second" | "seconds" => Ok(Self::Second),
+            "ms" | "msec" | "msecs" | "msecond" | "mseconds" | "millisecond" | "milliseconds" => {
+                Ok(Self::Millisecond)
+            }
+            "us" | "usec" | "usecs" | "usecond" | "useconds" | "microsecond" | "microseconds" => {
+                Ok(Self::Microsecond)
+            }
             "nanosecond" | "nanoseconds" => Ok(Self::Nanosecond),
-            _ => Err(ArrowError::NotYetImplemented(format!(
+            _ => Err(ArrowError::InvalidArgumentError(format!(
                 "Unknown interval type: {s}"
             ))),
         }
     }
 }
 
+impl IntervalUnit {
+    fn from_str_or_config(
+        s: Option<&str>,
+        config: &IntervalParseConfig,
+    ) -> Result<Self, ArrowError> {
+        match s {
+            Some(s) => s.parse(),
+            None => Ok(config.default_unit),
+        }
+    }
+}
+
+/// A tuple representing (months, days, nanoseconds) in an interval
 pub type MonthDayNano = (i32, i32, i64);
 
 /// Chosen based on the number of decimal digits in 1 week in nanoseconds
@@ -1352,68 +1423,35 @@ impl Interval {
     }
 }
 
-struct IntervalParseConfig {
-    /// The default unit to use if none is specified
-    /// e.g. `INTERVAL 1` represents `INTERVAL 1 SECOND` when default_unit = IntervalType::Second
-    default_unit: IntervalUnit,
-}
-
-impl IntervalParseConfig {
-    fn new(default_unit: IntervalUnit) -> Self {
-        Self { default_unit }
-    }
-}
-
 /// parse the string into a vector of interval components i.e. (amount, unit) tuples
 fn parse_interval_components(
     value: &str,
     config: &IntervalParseConfig,
 ) -> Result<Vec<(IntervalAmount, IntervalUnit)>, ArrowError> {
-    let parts = value.split_whitespace();
+    let raw_pairs = split_interval_components(value);
 
-    let raw_amounts = parts.clone().step_by(2);
-    let raw_units = parts.skip(1).step_by(2);
-
-    // parse amounts
-    let (amounts, invalid_amounts) = raw_amounts
-        .map(IntervalAmount::from_str)
-        .partition::<Vec<_>, _>(Result::is_ok);
-
-    // invalid amounts?
-    if !invalid_amounts.is_empty() {
-        return Err(ArrowError::NotYetImplemented(format!(
-            "Unsupported Interval Expression with value {value:?}"
-        )));
-    }
-
-    // parse units
-    let (units, invalid_units): (Vec<_>, Vec<_>) = raw_units
-        .clone()
-        .map(IntervalUnit::from_str)
-        .partition(Result::is_ok);
-
-    // invalid units?
-    if !invalid_units.is_empty() {
+    // parse amounts and units
+    let Ok(pairs): Result<Vec<(IntervalAmount, IntervalUnit)>, ArrowError> = raw_pairs
+        .iter()
+        .map(|(a, u)| Ok((a.parse()?, IntervalUnit::from_str_or_config(*u, config)?)))
+        .collect()
+    else {
         return Err(ArrowError::ParseError(format!(
             "Invalid input syntax for type interval: {value:?}"
         )));
-    }
+    };
 
     // collect parsed results
-    let amounts = amounts.into_iter().map(Result::unwrap).collect::<Vec<_>>();
-    let units = units.into_iter().map(Result::unwrap).collect::<Vec<_>>();
-
-    // if only an amount is specified, use the default unit
-    if amounts.len() == 1 && units.is_empty() {
-        return Ok(vec![(amounts[0], config.default_unit)]);
-    };
+    let (amounts, units): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
 
     // duplicate units?
     let mut observed_interval_types = 0;
-    for (unit, raw_unit) in units.iter().zip(raw_units) {
+    for (unit, (_, raw_unit)) in units.iter().zip(raw_pairs) {
         if observed_interval_types & (*unit as u16) != 0 {
             return Err(ArrowError::ParseError(format!(
-                "Invalid input syntax for type interval: {value:?}. Repeated type '{raw_unit}'",
+                "Invalid input syntax for type interval: {:?}. Repeated type '{}'",
+                value,
+                raw_unit.unwrap_or_default(),
             )));
         }
 
@@ -1423,6 +1461,33 @@ fn parse_interval_components(
     let result = amounts.iter().copied().zip(units.iter().copied());
 
     Ok(result.collect::<Vec<_>>())
+}
+
+/// Split an interval into a vec of amounts and units.
+///
+/// Pairs are separated by spaces, but within a pair the amount and unit may or may not be separated by a space.
+///
+/// This should match the behavior of PostgreSQL's interval parser.
+fn split_interval_components(value: &str) -> Vec<(&str, Option<&str>)> {
+    let mut result = vec![];
+    let mut words = value.split(char::is_whitespace);
+    while let Some(word) = words.next() {
+        if let Some(split_word_at) = word.find(not_interval_amount) {
+            let (amount, unit) = word.split_at(split_word_at);
+            result.push((amount, Some(unit)));
+        } else if let Some(unit) = words.next() {
+            result.push((word, Some(unit)));
+        } else {
+            result.push((word, None));
+            break;
+        }
+    }
+    result
+}
+
+/// test if a character is NOT part of an interval numeric amount
+fn not_interval_amount(c: char) -> bool {
+    !c.is_ascii_digit() && c != '.' && c != '-'
 }
 
 #[cfg(test)]
@@ -2202,6 +2267,78 @@ mod tests {
             )
             .unwrap(),
         );
+
+        // no units
+        assert_eq!(
+            Interval::new(1, 0, 0),
+            Interval::parse("1", &config).unwrap()
+        );
+        assert_eq!(
+            Interval::new(42, 0, 0),
+            Interval::parse("42", &config).unwrap()
+        );
+        assert_eq!(
+            Interval::new(0, 0, 42_000_000_000),
+            Interval::parse("42", &IntervalParseConfig::new(IntervalUnit::Second)).unwrap()
+        );
+
+        // shorter units
+        assert_eq!(
+            Interval::new(1, 0, 0),
+            Interval::parse("1 mon", &config).unwrap()
+        );
+        assert_eq!(
+            Interval::new(1, 0, 0),
+            Interval::parse("1 mons", &config).unwrap()
+        );
+        assert_eq!(
+            Interval::new(0, 0, 1_000_000),
+            Interval::parse("1 ms", &config).unwrap()
+        );
+        assert_eq!(
+            Interval::new(0, 0, 1_000),
+            Interval::parse("1 us", &config).unwrap()
+        );
+
+        // no space
+        assert_eq!(
+            Interval::new(0, 0, 1_000),
+            Interval::parse("1us", &config).unwrap()
+        );
+        assert_eq!(
+            Interval::new(0, 0, NANOS_PER_SECOND),
+            Interval::parse("1s", &config).unwrap()
+        );
+        assert_eq!(
+            Interval::new(1, 2, 10_864_000_000_000),
+            Interval::parse("1mon 2days 3hr 1min 4sec", &config).unwrap()
+        );
+
+        assert_eq!(
+            Interval::new(
+                -13i32,
+                -8i32,
+                -NANOS_PER_HOUR
+                    - NANOS_PER_MINUTE
+                    - NANOS_PER_SECOND
+                    - (1.11_f64 * NANOS_PER_MILLIS as f64) as i64
+            ),
+            Interval::parse(
+                "-1year -1month -1week -1day -1 hour -1 minute -1 second -1.11millisecond",
+                &config
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            Interval::parse("1h s", &config).unwrap_err().to_string(),
+            r#"Parser error: Invalid input syntax for type interval: "1h s""#
+        );
+
+        assert_eq!(
+            Interval::parse("1XX", &config).unwrap_err().to_string(),
+            r#"Parser error: Invalid input syntax for type interval: "1XX""#
+        );
     }
 
     #[test]
@@ -2547,6 +2684,21 @@ mod tests {
                 0i128,
                 15,
             ),
+            (
+                "-1e3",
+                -1000000000i128,
+                6,
+            ),
+            (
+                "+1e3",
+                1000000000i128,
+                6,
+            ),
+            (
+                "-1e31",
+                -10000000000000000000000000000000000000i128,
+                6,
+            ),
         ];
         for (s, i, scale) in edge_tests_128 {
             let result_128 = parse_decimal::<Decimal128Type>(s, 38, scale);
@@ -2624,5 +2776,17 @@ mod tests {
         assert_eq!(Float64Type::parse("+"), None);
         assert_eq!(TimestampNanosecondType::parse(""), None);
         assert_eq!(Date32Type::parse(""), None);
+    }
+
+    #[test]
+    fn test_parse_interval_month_day_nano_config() {
+        let interval = parse_interval_month_day_nano_config(
+            "1",
+            IntervalParseConfig::new(IntervalUnit::Second),
+        )
+        .unwrap();
+        assert_eq!(interval.months, 0);
+        assert_eq!(interval.days, 0);
+        assert_eq!(interval.nanoseconds, NANOS_PER_SECOND);
     }
 }

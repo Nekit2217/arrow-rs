@@ -39,6 +39,7 @@ pub use crate::format::{
 // Mirrors `parquet::Type`
 
 /// Types supported by Parquet.
+///
 /// These physical types are intended to be used in combination with the encodings to
 /// control the on disk storage format.
 /// For example INT16 is not included as a type since a good encoding of INT32
@@ -46,13 +47,21 @@ pub use crate::format::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum Type {
+    /// A boolean value.
     BOOLEAN,
+    /// 32-bit signed integer.
     INT32,
+    /// 64-bit signed integer.
     INT64,
+    /// 96-bit signed integer for timestamps.
     INT96,
+    /// IEEE 754 single-precision floating point value.
     FLOAT,
+    /// IEEE 754 double-precision floating point value.
     DOUBLE,
+    /// Arbitrary length byte array.
     BYTE_ARRAY,
+    /// Fixed length byte array.
     FIXED_LEN_BYTE_ARRAY,
 }
 
@@ -60,6 +69,7 @@ pub enum Type {
 // Mirrors `parquet::ConvertedType`
 
 /// Common types (converted types) used by frameworks when using Parquet.
+///
 /// This helps map between types in those frameworks to the base types in Parquet.
 /// This is only metadata and not needed to read or write the data.
 ///
@@ -68,6 +78,7 @@ pub enum Type {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum ConvertedType {
+    /// No type conversion.
     NONE,
     /// A BYTE_ARRAY actually contains UTF8 encoded chars.
     UTF8,
@@ -169,31 +180,53 @@ pub enum ConvertedType {
 /// [`ConvertedType`]. Please see the README.md for more details.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogicalType {
+    /// A UTF8 encoded string.
     String,
+    /// A map of key-value pairs.
     Map,
+    /// A list of elements.
     List,
+    /// A set of predefined values.
     Enum,
+    /// A decimal value with a specified scale and precision.
     Decimal {
+        /// The number of digits in the decimal.
         scale: i32,
+        /// The location of the decimal point.
         precision: i32,
     },
+    /// A date stored as days since Unix epoch.
     Date,
+    /// A time stored as [`TimeUnit`] since midnight.
     Time {
+        /// Whether the time is adjusted to UTC.
         is_adjusted_to_u_t_c: bool,
+        /// The unit of time.
         unit: TimeUnit,
     },
+    /// A timestamp stored as [`TimeUnit`] since Unix epoch.
     Timestamp {
+        /// Whether the timestamp is adjusted to UTC.
         is_adjusted_to_u_t_c: bool,
+        /// The unit of time.
         unit: TimeUnit,
     },
+    /// An integer with a specified bit width and signedness.
     Integer {
+        /// The number of bits in the integer.
         bit_width: i8,
+        /// Whether the integer is signed.
         is_signed: bool,
     },
+    /// An unknown logical type.
     Unknown,
+    /// A JSON document.
     Json,
+    /// A BSON document.
     Bson,
+    /// A UUID.
     Uuid,
+    /// A 16-bit floating point number.
     Float16,
 }
 
@@ -294,13 +327,14 @@ pub enum Encoding {
     /// The ids are encoded using the RLE encoding.
     RLE_DICTIONARY,
 
-    /// Encoding for floating-point data.
+    /// Encoding for fixed-width data.
     ///
     /// K byte-streams are created where K is the size in bytes of the data type.
-    /// The individual bytes of an FP value are scattered to the corresponding stream and
+    /// The individual bytes of a value are scattered to the corresponding stream and
     /// the streams are concatenated.
     /// This itself does not reduce the size of the data but can lead to better compression
-    /// afterwards.
+    /// afterwards. Note that the use of this encoding with FIXED_LEN_BYTE_ARRAY(N) data may
+    /// perform poorly for large values of N.
     BYTE_STREAM_SPLIT,
 }
 
@@ -347,14 +381,30 @@ impl FromStr for Encoding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum Compression {
+    /// No compression.
     UNCOMPRESSED,
+    /// [Snappy compression](https://en.wikipedia.org/wiki/Snappy_(compression))
     SNAPPY,
+    /// [Gzip compression](https://www.ietf.org/rfc/rfc1952.txt)
     GZIP(GzipLevel),
+    /// [LZO compression](https://en.wikipedia.org/wiki/Lempel%E2%80%93Ziv%E2%80%93Oberhumer)
     LZO,
+    /// [Brotli compression](https://datatracker.ietf.org/doc/html/rfc7932)
     BROTLI(BrotliLevel),
+    /// [LZ4 compression](https://lz4.org/), [(deprecated)](https://issues.apache.org/jira/browse/PARQUET-2032)
     LZ4,
+    /// [ZSTD compression](https://datatracker.ietf.org/doc/html/rfc8878)
     ZSTD(ZstdLevel),
+    /// [LZ4 compression](https://lz4.org/).
     LZ4_RAW,
+}
+
+impl Compression {
+    /// Returns the codec type of this compression setting as a string, without the compression
+    /// level.
+    pub(crate) fn codec_to_string(self) -> String {
+        format!("{:?}", self).split('(').next().unwrap().to_owned()
+    }
 }
 
 fn split_compression_string(str_setting: &str) -> Result<(&str, Option<u32>), ParquetError> {
@@ -436,16 +486,20 @@ impl FromStr for Compression {
 }
 
 // ----------------------------------------------------------------------
-// Mirrors `parquet::PageType`
-
+/// Mirrors [parquet::PageType]
+///
 /// Available data pages for Parquet file format.
 /// Note that some of the page types may not be supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum PageType {
+    /// Data page Parquet 1.0
     DATA_PAGE,
+    /// Index page
     INDEX_PAGE,
+    /// Dictionary page
     DICTIONARY_PAGE,
+    /// Data page Parquet 2.0
     DATA_PAGE_V2,
 }
 
@@ -1911,6 +1965,15 @@ mod tests {
         assert_eq!(
             parquet::Encoding::DELTA_BYTE_ARRAY,
             Encoding::DELTA_BYTE_ARRAY.into()
+        );
+    }
+
+    #[test]
+    fn test_compression_codec_to_string() {
+        assert_eq!(Compression::UNCOMPRESSED.codec_to_string(), "UNCOMPRESSED");
+        assert_eq!(
+            Compression::ZSTD(ZstdLevel::default()).codec_to_string(),
+            "ZSTD"
         );
     }
 

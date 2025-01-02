@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Zip two arrays by some boolean mask. Where the mask evaluates `true` values of `truthy`
+
 use crate::filter::SlicesIterator;
 use arrow_array::*;
 use arrow_data::transform::MutableArrayData;
@@ -51,7 +53,7 @@ pub fn zip(
             "all arrays should have the same length".into(),
         ));
     }
-    if truthy_is_scalar && truthy.len() != 1 {
+    if falsy_is_scalar && falsy.len() != 1 {
         return Err(ArrowError::InvalidArgumentError(
             "scalar arrays must have 1 element".into(),
         ));

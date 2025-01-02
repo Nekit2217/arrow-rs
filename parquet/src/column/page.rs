@@ -21,7 +21,7 @@ use bytes::Bytes;
 
 use crate::basic::{Encoding, PageType};
 use crate::errors::{ParquetError, Result};
-use crate::file::{metadata::ColumnChunkMetaData, statistics::Statistics};
+use crate::file::statistics::Statistics;
 use crate::format::PageHeader;
 
 /// Parquet Page definition.
@@ -31,29 +31,51 @@ use crate::format::PageHeader;
 /// used to store uncompressed bytes of the page.
 #[derive(Clone)]
 pub enum Page {
+    /// Data page Parquet format v1.
     DataPage {
+        /// The underlying data buffer
         buf: Bytes,
+        /// Number of values in this page
         num_values: u32,
+        /// Encoding for values in this page
         encoding: Encoding,
+        /// Definition level encoding
         def_level_encoding: Encoding,
+        /// Repetition level encoding
         rep_level_encoding: Encoding,
+        /// Optional statistics for this page
         statistics: Option<Statistics>,
     },
+    /// Data page Parquet format v2.
     DataPageV2 {
+        /// The underlying data buffer
         buf: Bytes,
+        /// Number of values in this page
         num_values: u32,
+        /// Encoding for values in this page
         encoding: Encoding,
+        /// Number of null values in this page
         num_nulls: u32,
+        /// Number of rows in this page
         num_rows: u32,
+        /// Length of definition levels
         def_levels_byte_len: u32,
+        /// Length of repetition levels
         rep_levels_byte_len: u32,
+        /// Is this page compressed
         is_compressed: bool,
+        /// Optional statistics for this page
         statistics: Option<Statistics>,
     },
+    /// Dictionary page.
     DictionaryPage {
+        /// The underlying data buffer
         buf: Bytes,
+        /// Number of values in this page
         num_values: u32,
+        /// Encoding for values in this page
         encoding: Encoding,
+        /// Is dictionary page sorted
         is_sorted: bool,
     },
 }
@@ -235,11 +257,17 @@ impl CompressedPage {
 
 /// Contains page write metrics.
 pub struct PageWriteSpec {
+    /// The type of page being written
     pub page_type: PageType,
+    /// The total size of the page, before compression
     pub uncompressed_size: usize,
+    /// The compressed size of the page
     pub compressed_size: usize,
+    /// The number of values in the page
     pub num_values: u32,
+    /// The offset of the page in the column chunk
     pub offset: u64,
+    /// The number of bytes written to the underlying sink
     pub bytes_written: u64,
 }
 
@@ -350,12 +378,6 @@ pub trait PageWriter: Send {
     /// either data page or dictionary page.
     fn write_page(&mut self, page: CompressedPage) -> Result<PageWriteSpec>;
 
-    /// Writes column chunk metadata into the output stream/sink.
-    ///
-    /// This method is called once before page writer is closed, normally when writes are
-    /// finalised in column writer.
-    fn write_metadata(&mut self, metadata: &ColumnChunkMetaData) -> Result<()>;
-
     /// Closes resources and flushes underlying sink.
     /// Page writer should not be used after this method is called.
     fn close(&mut self) -> Result<()>;
@@ -376,7 +398,7 @@ mod tests {
             encoding: Encoding::PLAIN,
             def_level_encoding: Encoding::RLE,
             rep_level_encoding: Encoding::RLE,
-            statistics: Some(Statistics::int32(Some(1), Some(2), None, 1, true)),
+            statistics: Some(Statistics::int32(Some(1), Some(2), None, Some(1), true)),
         };
         assert_eq!(data_page.page_type(), PageType::DATA_PAGE);
         assert_eq!(data_page.buffer(), vec![0, 1, 2].as_slice());
@@ -384,7 +406,7 @@ mod tests {
         assert_eq!(data_page.encoding(), Encoding::PLAIN);
         assert_eq!(
             data_page.statistics(),
-            Some(&Statistics::int32(Some(1), Some(2), None, 1, true))
+            Some(&Statistics::int32(Some(1), Some(2), None, Some(1), true))
         );
 
         let data_page_v2 = Page::DataPageV2 {
@@ -396,7 +418,7 @@ mod tests {
             def_levels_byte_len: 30,
             rep_levels_byte_len: 40,
             is_compressed: false,
-            statistics: Some(Statistics::int32(Some(1), Some(2), None, 1, true)),
+            statistics: Some(Statistics::int32(Some(1), Some(2), None, Some(1), true)),
         };
         assert_eq!(data_page_v2.page_type(), PageType::DATA_PAGE_V2);
         assert_eq!(data_page_v2.buffer(), vec![0, 1, 2].as_slice());
@@ -404,7 +426,7 @@ mod tests {
         assert_eq!(data_page_v2.encoding(), Encoding::PLAIN);
         assert_eq!(
             data_page_v2.statistics(),
-            Some(&Statistics::int32(Some(1), Some(2), None, 1, true))
+            Some(&Statistics::int32(Some(1), Some(2), None, Some(1), true))
         );
 
         let dict_page = Page::DictionaryPage {
@@ -428,7 +450,7 @@ mod tests {
             encoding: Encoding::PLAIN,
             def_level_encoding: Encoding::RLE,
             rep_level_encoding: Encoding::RLE,
-            statistics: Some(Statistics::int32(Some(1), Some(2), None, 1, true)),
+            statistics: Some(Statistics::int32(Some(1), Some(2), None, Some(1), true)),
         };
 
         let cpage = CompressedPage::new(data_page, 5);

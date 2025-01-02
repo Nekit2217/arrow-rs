@@ -24,6 +24,7 @@ use crate::{Array, ArrayAccessor, ArrayRef, GenericByteArray, OffsetSizeTrait, S
 use arrow_buffer::{ArrowNativeType, Buffer, NullBuffer, ScalarBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder, ByteView};
 use arrow_schema::{ArrowError, DataType};
+use core::str;
 use num::ToPrimitive;
 use std::any::Any;
 use std::fmt::Debug;
@@ -32,21 +33,34 @@ use std::sync::Arc;
 
 use super::ByteArrayType;
 
-/// [Variable-size Binary View Layout]: An array of variable length bytes view arrays.
+/// [Variable-size Binary View Layout]: An array of variable length bytes views.
 ///
-/// Different than [`crate::GenericByteArray`] as it stores both an offset and length
-/// meaning that take / filter operations can be implemented without copying the underlying data.
-///
-/// See [`StringViewArray`] for storing utf8 encoded string data and
-/// [`BinaryViewArray`] for storing bytes.
+/// This array type is used to store variable length byte data (e.g. Strings, Binary)
+/// and has efficient operations such as `take`, `filter`, and comparison.
 ///
 /// [Variable-size Binary View Layout]: https://arrow.apache.org/docs/format/Columnar.html#variable-size-binary-view-layout
+///
+/// This is different from [`GenericByteArray`], which also stores variable
+/// length byte data, as it represents strings with an offset and length. `take`
+/// and `filter` like operations are implemented by manipulating the "views"
+/// (`u128`) without modifying the bytes. Each view also stores an inlined
+/// prefix which speed up comparisons.
+///
+/// # See Also
+///
+/// * [`StringViewArray`] for storing utf8 encoded string data
+/// * [`BinaryViewArray`] for storing bytes
+/// * [`ByteView`] to interpret `u128`s layout of the views.
+///
+/// [`ByteView`]: arrow_data::ByteView
+///
+/// # Layout: "views" and buffers
 ///
 /// A `GenericByteViewArray` stores variable length byte strings. An array of
 /// `N` elements is stored as `N` fixed length "views" and a variable number
 /// of variable length "buffers".
 ///
-/// Each view is a `u128` value  layout is different depending on the
+/// Each view is a `u128` value whose layout is different depending on the
 /// length of the string stored at that location:
 ///
 /// ```text
@@ -63,10 +77,58 @@ use super::ByteArrayType;
 ///                          0    31       63      95    127
 /// ```
 ///
-/// * Strings with length <= 12 are stored directly in the view.
+/// * Strings with length <= 12 are stored directly in the view. See
+///   [`Self::inline_value`] to access the inlined prefix from a short view.
 ///
 /// * Strings with length > 12: The first four bytes are stored inline in the
-/// view and the entire string is stored in one of the buffers.
+///   view and the entire string is stored in one of the buffers. See [`ByteView`]
+///   to access the fields of the these views.
+///
+/// As with other arrays, the optimized kernels in [`arrow_compute`] are likely
+/// the easiest and fastest way to work with this data. However, it is possible
+/// to access the views and buffers directly for more control.
+///
+/// For example
+///
+/// ```rust
+/// # use arrow_array::StringViewArray;
+/// # use arrow_array::Array;
+/// use arrow_data::ByteView;
+/// let array = StringViewArray::from(vec![
+///   "hello",
+///   "this string is longer than 12 bytes",
+///   "this string is also longer than 12 bytes"
+/// ]);
+///
+/// // ** Examine the first view (short string) **
+/// assert!(array.is_valid(0)); // Check for nulls
+/// let short_view: u128 = array.views()[0]; // "hello"
+/// // get length of the string
+/// let len = short_view as u32;
+/// assert_eq!(len, 5); // strings less than 12 bytes are stored in the view
+/// // SAFETY: `view` is a valid view
+/// let value = unsafe {
+///   StringViewArray::inline_value(&short_view, len as usize)
+/// };
+/// assert_eq!(value, b"hello");
+///
+/// // ** Examine the third view (long string) **
+/// assert!(array.is_valid(12)); // Check for nulls
+/// let long_view: u128 = array.views()[2]; // "this string is also longer than 12 bytes"
+/// let len = long_view as u32;
+/// assert_eq!(len, 40); // strings longer than 12 bytes are stored in the buffer
+/// let view = ByteView::from(long_view); // use ByteView to access the fields
+/// assert_eq!(view.length, 40);
+/// assert_eq!(view.buffer_index, 0);
+/// assert_eq!(view.offset, 35); // data starts after the first long string
+/// // Views for long strings store a 4 byte prefix
+/// let prefix = view.prefix.to_le_bytes();
+/// assert_eq!(&prefix, b"this");
+/// let value = array.value(2); // get the string value (see `value` implementation for how to access the bytes directly)
+/// assert_eq!(value, "this string is also longer than 12 bytes");
+/// ```
+///
+/// [`arrow_compute`]: https://docs.rs/arrow/latest/arrow/compute/index.html
 ///
 /// Unlike [`GenericByteArray`], there are no constraints on the offsets other
 /// than they must point into a valid buffer. However, they can be out of order,
@@ -76,6 +138,8 @@ use super::ByteArrayType;
 /// "CrumpleFacedFish" are both longer than 12 bytes and thus are stored in a
 /// separate buffer while the string "LavaMonster" is stored inlined in the
 /// view. In this case, the same bytes for "Fish" are used to store both strings.
+///
+/// [`ByteView`]: arrow_data::ByteView
 ///
 /// ```text
 ///                                                                            ┌───┐
@@ -95,7 +159,6 @@ use super::ByteArrayType;
 ///                                                                   buffer 0 │...│
 ///                                                                            └───┘
 /// ```
-/// [`GenericByteArray`]: crate::array::GenericByteArray
 pub struct GenericByteViewArray<T: ByteViewType + ?Sized> {
     data_type: DataType,
     views: ScalarBuffer<u128>,
@@ -240,9 +303,12 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
         unsafe { self.value_unchecked(i) }
     }
 
-    /// Returns the element at index `i`
+    /// Returns the element at index `i` without bounds checking
+    ///
     /// # Safety
-    /// Caller is responsible for ensuring that the index is within the bounds of the array
+    ///
+    /// Caller is responsible for ensuring that the index is within the bounds
+    /// of the array
     pub unsafe fn value_unchecked(&self, idx: usize) -> &T::Native {
         let v = self.views.get_unchecked(idx);
         let len = *v as u32;
@@ -257,7 +323,7 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
         T::Native::from_bytes_unchecked(b)
     }
 
-    /// Returns the inline value of the view.
+    /// Returns the first `len` bytes the inline value of the view.
     ///
     /// # Safety
     /// - The `view` must be a valid element from `Self::views()` that adheres to the view layout.
@@ -268,9 +334,81 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
         std::slice::from_raw_parts((view as *const u128 as *const u8).wrapping_add(4), len)
     }
 
-    /// constructs a new iterator
+    /// Constructs a new iterator for iterating over the values of this array
     pub fn iter(&self) -> ArrayIter<&Self> {
         ArrayIter::new(self)
+    }
+
+    /// Returns an iterator over the bytes of this array, including null values
+    pub fn bytes_iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.views.iter().map(move |v| {
+            let len = *v as u32;
+            if len <= 12 {
+                unsafe { Self::inline_value(v, len as usize) }
+            } else {
+                let view = ByteView::from(*v);
+                let data = &self.buffers[view.buffer_index as usize];
+                let offset = view.offset as usize;
+                unsafe { data.get_unchecked(offset..offset + len as usize) }
+            }
+        })
+    }
+
+    /// Returns an iterator over the first `prefix_len` bytes of each array
+    /// element, including null values.
+    ///
+    /// If `prefix_len` is larger than the element's length, the iterator will
+    /// return an empty slice (`&[]`).
+    pub fn prefix_bytes_iter(&self, prefix_len: usize) -> impl Iterator<Item = &[u8]> {
+        self.views().into_iter().map(move |v| {
+            let len = (*v as u32) as usize;
+
+            if len < prefix_len {
+                return &[] as &[u8];
+            }
+
+            if prefix_len <= 4 || len <= 12 {
+                unsafe { StringViewArray::inline_value(v, prefix_len) }
+            } else {
+                let view = ByteView::from(*v);
+                let data = unsafe {
+                    self.data_buffers()
+                        .get_unchecked(view.buffer_index as usize)
+                };
+                let offset = view.offset as usize;
+                unsafe { data.get_unchecked(offset..offset + prefix_len) }
+            }
+        })
+    }
+
+    /// Returns an iterator over the last `suffix_len` bytes of each array
+    /// element, including null values.
+    ///
+    /// Note that for [`StringViewArray`] the last bytes may start in the middle
+    /// of a UTF-8 codepoint, and thus may not be a valid `&str`.
+    ///
+    /// If `suffix_len` is larger than the element's length, the iterator will
+    /// return an empty slice (`&[]`).
+    pub fn suffix_bytes_iter(&self, suffix_len: usize) -> impl Iterator<Item = &[u8]> {
+        self.views().into_iter().map(move |v| {
+            let len = (*v as u32) as usize;
+
+            if len < suffix_len {
+                return &[] as &[u8];
+            }
+
+            if len <= 12 {
+                unsafe { &StringViewArray::inline_value(v, len)[len - suffix_len..] }
+            } else {
+                let view = ByteView::from(*v);
+                let data = unsafe {
+                    self.data_buffers()
+                        .get_unchecked(view.buffer_index as usize)
+                };
+                let offset = view.offset as usize;
+                unsafe { data.get_unchecked(offset + len - suffix_len..offset + len) }
+            }
+        })
     }
 
     /// Returns a zero-copy slice of this array with the indicated offset and length.
@@ -324,6 +462,9 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
     /// Note that it will copy the array regardless of whether the original array is compact.
     /// Use with caution as this can be an expensive operation, only use it when you are sure that the view
     /// array is significantly smaller than when it is originally created, e.g., after filtering or slicing.
+    ///
+    /// Note: this function does not attempt to canonicalize / deduplicate values. For this
+    /// feature see  [`GenericByteViewBuilder::with_deduplicate_strings`].
     pub fn gc(&self) -> Self {
         let mut builder = GenericByteViewBuilder::<T>::with_capacity(self.len());
 
@@ -332,6 +473,66 @@ impl<T: ByteViewType + ?Sized> GenericByteViewArray<T> {
         }
 
         builder.finish()
+    }
+
+    /// Compare two [`GenericByteViewArray`] at index `left_idx` and `right_idx`
+    ///
+    /// Comparing two ByteView types are non-trivial.
+    /// It takes a bit of patience to understand why we don't just compare two &[u8] directly.
+    ///
+    /// ByteView types give us the following two advantages, and we need to be careful not to lose them:
+    /// (1) For string/byte smaller than 12 bytes, the entire data is inlined in the view.
+    ///     Meaning that reading one array element requires only one memory access
+    ///     (two memory access required for StringArray, one for offset buffer, the other for value buffer).
+    ///
+    /// (2) For string/byte larger than 12 bytes, we can still be faster than (for certain operations) StringArray/ByteArray,
+    ///     thanks to the inlined 4 bytes.
+    ///     Consider equality check:
+    ///     If the first four bytes of the two strings are different, we can return false immediately (with just one memory access).
+    ///
+    /// If we directly compare two &[u8], we materialize the entire string (i.e., make multiple memory accesses), which might be unnecessary.
+    /// - Most of the time (eq, ord), we only need to look at the first 4 bytes to know the answer,
+    ///   e.g., if the inlined 4 bytes are different, we can directly return unequal without looking at the full string.
+    ///
+    /// # Order check flow
+    /// (1) if both string are smaller than 12 bytes, we can directly compare the data inlined to the view.
+    /// (2) if any of the string is larger than 12 bytes, we need to compare the full string.
+    ///     (2.1) if the inlined 4 bytes are different, we can return the result immediately.
+    ///     (2.2) o.w., we need to compare the full string.
+    ///
+    /// # Safety
+    /// The left/right_idx must within range of each array
+    pub unsafe fn compare_unchecked(
+        left: &GenericByteViewArray<T>,
+        left_idx: usize,
+        right: &GenericByteViewArray<T>,
+        right_idx: usize,
+    ) -> std::cmp::Ordering {
+        let l_view = left.views().get_unchecked(left_idx);
+        let l_len = *l_view as u32;
+
+        let r_view = right.views().get_unchecked(right_idx);
+        let r_len = *r_view as u32;
+
+        if l_len <= 12 && r_len <= 12 {
+            let l_data = unsafe { GenericByteViewArray::<T>::inline_value(l_view, l_len as usize) };
+            let r_data = unsafe { GenericByteViewArray::<T>::inline_value(r_view, r_len as usize) };
+            return l_data.cmp(r_data);
+        }
+
+        // one of the string is larger than 12 bytes,
+        // we then try to compare the inlined data first
+        let l_inlined_data = unsafe { GenericByteViewArray::<T>::inline_value(l_view, 4) };
+        let r_inlined_data = unsafe { GenericByteViewArray::<T>::inline_value(r_view, 4) };
+        if r_inlined_data != l_inlined_data {
+            return l_inlined_data.cmp(r_inlined_data);
+        }
+
+        // unfortunately, we need to compare the full data
+        let l_full_data: &[u8] = unsafe { left.value_unchecked(left_idx).as_ref() };
+        let r_full_data: &[u8] = unsafe { right.value_unchecked(right_idx).as_ref() };
+
+        l_full_data.cmp(r_full_data)
     }
 }
 
@@ -380,6 +581,11 @@ impl<T: ByteViewType + ?Sized> Array for GenericByteViewArray<T> {
 
     fn nulls(&self) -> Option<&NullBuffer> {
         self.nulls.as_ref()
+    }
+
+    fn logical_null_count(&self) -> usize {
+        // More efficient that the default implementation
+        self.null_count()
     }
 
     fn get_buffer_memory_size(&self) -> usize {
@@ -432,8 +638,16 @@ impl<T: ByteViewType + ?Sized> From<ArrayData> for GenericByteViewArray<T> {
     }
 }
 
-/// Convert a [`GenericByteArray`] to a [`GenericByteViewArray`] but in a smart way:
-/// If the offsets are all less than u32::MAX, then we directly build the view array on top of existing buffer.
+/// Efficiently convert a [`GenericByteArray`] to a [`GenericByteViewArray`]
+///
+/// For example this method can convert a [`StringArray`] to a
+/// [`StringViewArray`].
+///
+/// If the offsets are all less than u32::MAX, the new [`GenericByteViewArray`]
+/// is built without copying the underlying string data (views are created
+/// directly into the existing buffer)
+///
+/// [`StringArray`]: crate::StringArray
 impl<FROM, V> From<&GenericByteArray<FROM>> for GenericByteViewArray<V>
 where
     FROM: ByteArrayType,
@@ -449,6 +663,7 @@ where
         };
 
         if can_reuse_buffer {
+            // build views directly pointing to the existing buffer
             let len = byte_array.len();
             let mut views_builder = GenericByteViewBuilder::<V>::with_capacity(len);
             let str_values_buf = byte_array.values().clone();
@@ -471,7 +686,9 @@ where
             assert_eq!(views_builder.len(), len);
             views_builder.finish()
         } else {
-            // TODO: the first u32::MAX can still be reused
+            // Otherwise, create a new buffer for large strings
+            // TODO: the original buffer could still be used
+            // by making multiple slices of u32::MAX length
             GenericByteViewArray::<V>::from_iter(byte_array.iter())
         }
     }
@@ -516,6 +733,8 @@ where
 
 /// A [`GenericByteViewArray`] of `[u8]`
 ///
+/// See [`GenericByteViewArray`] for format and layout details.
+///
 /// # Example
 /// ```
 /// use arrow_array::BinaryViewArray;
@@ -554,6 +773,8 @@ impl From<Vec<Option<&[u8]>>> for BinaryViewArray {
 }
 
 /// A [`GenericByteViewArray`] that stores utf8 data
+///
+/// See [`GenericByteViewArray`] for format and layout details.
 ///
 /// # Example
 /// ```
@@ -694,7 +915,7 @@ mod tests {
     fn test_in_progress_recreation() {
         let array = {
             // make a builder with small block size.
-            let mut builder = StringViewBuilder::new().with_block_size(14);
+            let mut builder = StringViewBuilder::new().with_fixed_block_size(14);
             builder.append_value("large payload over 12 bytes");
             builder.append_option(Some("another large payload over 12 bytes that double than the first one, so that we can trigger the in_progress in builder re-created"));
             builder.finish()
@@ -708,12 +929,9 @@ mod tests {
     #[should_panic(expected = "Invalid buffer index at 0: got index 3 but only has 1 buffers")]
     fn new_with_invalid_view_data() {
         let v = "large payload over 12 bytes";
-        let view = ByteView {
-            length: 13,
-            prefix: u32::from_le_bytes(v.as_bytes()[0..4].try_into().unwrap()),
-            buffer_index: 3,
-            offset: 1,
-        };
+        let view = ByteView::new(13, &v.as_bytes()[0..4])
+            .with_buffer_index(3)
+            .with_offset(1);
         let views = ScalarBuffer::from(vec![view.into()]);
         let buffers = vec![Buffer::from_slice_ref(v)];
         StringViewArray::new(views, buffers, None);
@@ -724,13 +942,12 @@ mod tests {
         expected = "Encountered non-UTF-8 data at index 0: invalid utf-8 sequence of 1 bytes from index 0"
     )]
     fn new_with_invalid_utf8_data() {
-        let v: Vec<u8> = vec![0xf0, 0x80, 0x80, 0x80];
-        let view = ByteView {
-            length: v.len() as u32,
-            prefix: u32::from_le_bytes(v[0..4].try_into().unwrap()),
-            buffer_index: 0,
-            offset: 0,
-        };
+        let v: Vec<u8> = vec![
+            // invalid UTF8
+            0xf0, 0x80, 0x80, 0x80, // more bytes to make it larger than 12
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let view = ByteView::new(v.len() as u32, &v[0..4]);
         let views = ScalarBuffer::from(vec![view.into()]);
         let buffers = vec![Buffer::from_slice_ref(v)];
         StringViewArray::new(views, buffers, None);
@@ -785,7 +1002,7 @@ mod tests {
         ];
 
         let array = {
-            let mut builder = StringViewBuilder::new().with_block_size(8); // create multiple buffers
+            let mut builder = StringViewBuilder::new().with_fixed_block_size(8); // create multiple buffers
             test_data.into_iter().for_each(|v| builder.append_option(v));
             builder.finish()
         };
@@ -806,5 +1023,30 @@ mod tests {
         check_gc(&array.slice(2, 1));
         check_gc(&array.slice(2, 2));
         check_gc(&array.slice(3, 1));
+    }
+
+    #[test]
+    fn test_eq() {
+        let test_data = [
+            Some("longer than 12 bytes"),
+            None,
+            Some("short"),
+            Some("again, this is longer than 12 bytes"),
+        ];
+
+        let array1 = {
+            let mut builder = StringViewBuilder::new().with_fixed_block_size(8);
+            test_data.into_iter().for_each(|v| builder.append_option(v));
+            builder.finish()
+        };
+        let array2 = {
+            // create a new array with the same data but different layout
+            let mut builder = StringViewBuilder::new().with_fixed_block_size(100);
+            test_data.into_iter().for_each(|v| builder.append_option(v));
+            builder.finish()
+        };
+        assert_eq!(array1, array1.clone());
+        assert_eq!(array2, array2.clone());
+        assert_eq!(array1, array2);
     }
 }

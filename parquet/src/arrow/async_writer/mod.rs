@@ -22,6 +22,7 @@
 //! read the documentation there before using this API.
 //!
 //! Here is an example for using [`AsyncArrowWriter`]:
+//!
 //! ```
 //! # #[tokio::main(flavor="current_thread")]
 //! # async fn main() {
@@ -49,12 +50,19 @@
 //! assert_eq!(to_write, read);
 //! # }
 //! ```
+//!
+//! [`object_store`] provides it's native implementation of [`AsyncFileWriter`] by [`ParquetObjectWriter`].
+
+#[cfg(feature = "object_store")]
+mod store;
+#[cfg(feature = "object_store")]
+pub use store::*;
 
 use crate::{
     arrow::arrow_writer::ArrowWriterOptions,
     arrow::ArrowWriter,
     errors::{ParquetError, Result},
-    file::{metadata::RowGroupMetaDataPtr, properties::WriterProperties},
+    file::{metadata::RowGroupMetaData, properties::WriterProperties},
     format::{FileMetaData, KeyValue},
 };
 use arrow_array::RecordBatch;
@@ -65,7 +73,7 @@ use futures::FutureExt;
 use std::mem;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-/// The asynchronous interface used by [`AsyncArrowWriter`] to write parquet files
+/// The asynchronous interface used by [`AsyncArrowWriter`] to write parquet files.
 pub trait AsyncFileWriter: Send {
     /// Write the provided bytes to the underlying writer
     ///
@@ -172,11 +180,20 @@ impl<W: AsyncFileWriter> AsyncArrowWriter<W> {
     }
 
     /// Returns metadata for any flushed row groups
-    pub fn flushed_row_groups(&self) -> &[RowGroupMetaDataPtr] {
+    pub fn flushed_row_groups(&self) -> &[RowGroupMetaData] {
         self.sync_writer.flushed_row_groups()
     }
 
-    /// Returns the estimated length in bytes of the current in progress row group
+    /// Estimated memory usage, in bytes, of this `ArrowWriter`
+    ///
+    /// See [ArrowWriter::memory_size] for more information.
+    pub fn memory_size(&self) -> usize {
+        self.sync_writer.memory_size()
+    }
+
+    /// Anticipated encoded size of the in progress row group.
+    ///
+    /// See [ArrowWriter::memory_size] for more information.
     pub fn in_progress_size(&self) -> usize {
         self.sync_writer.in_progress_size()
     }
@@ -222,7 +239,11 @@ impl<W: AsyncFileWriter> AsyncArrowWriter<W> {
     /// Close and finalize the writer.
     ///
     /// All the data in the inner buffer will be force flushed.
-    pub async fn close(mut self) -> Result<FileMetaData> {
+    ///
+    /// Unlike [`Self::close`] this does not consume self
+    ///
+    /// Attempting to write after calling finish will result in an error
+    pub async fn finish(&mut self) -> Result<FileMetaData> {
         let metadata = self.sync_writer.finish()?;
 
         // Force to flush the remaining data.
@@ -230,6 +251,13 @@ impl<W: AsyncFileWriter> AsyncArrowWriter<W> {
         self.async_writer.complete().await?;
 
         Ok(metadata)
+    }
+
+    /// Close and finalize the writer.
+    ///
+    /// All the data in the inner buffer will be force flushed.
+    pub async fn close(mut self) -> Result<FileMetaData> {
+        self.finish().await
     }
 
     /// Flush the data written by `sync_writer` into the `async_writer`
@@ -369,6 +397,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_async_writer_bytes_written() {
+        let col = Arc::new(Int64Array::from_iter_values([1, 2, 3])) as ArrayRef;
+        let to_write = RecordBatch::try_from_iter([("col", col)]).unwrap();
+
+        let temp = tempfile::tempfile().unwrap();
+
+        let file = tokio::fs::File::from_std(temp.try_clone().unwrap());
+        let mut writer =
+            AsyncArrowWriter::try_new(file.try_clone().await.unwrap(), to_write.schema(), None)
+                .unwrap();
+        writer.write(&to_write).await.unwrap();
+        let _metadata = writer.finish().await.unwrap();
+        // After `finish` this should include the metadata and footer
+        let reported = writer.bytes_written();
+
+        // Get actual size from file metadata
+        let actual = file.metadata().await.unwrap().len() as usize;
+
+        assert_eq!(reported, actual);
+    }
+
+    #[tokio::test]
     async fn test_async_writer_file() {
         let col = Arc::new(Int64Array::from_iter_values([1, 2, 3])) as ArrayRef;
         let col2 = Arc::new(BinaryArray::from_iter_values(vec![
@@ -419,16 +469,30 @@ mod tests {
         let initial_size = writer.in_progress_size();
         assert!(initial_size > 0);
         assert_eq!(writer.in_progress_rows(), batch.num_rows());
+        let initial_memory = writer.memory_size();
+        // memory estimate is larger than estimated encoded size
+        assert!(
+            initial_size <= initial_memory,
+            "{initial_size} <= {initial_memory}"
+        );
 
         // updated on second write
         writer.write(&batch).await.unwrap();
         assert!(writer.in_progress_size() > initial_size);
         assert_eq!(writer.in_progress_rows(), batch.num_rows() * 2);
+        assert!(writer.memory_size() > initial_memory);
+        assert!(
+            writer.in_progress_size() <= writer.memory_size(),
+            "in_progress_size {} <= memory_size {}",
+            writer.in_progress_size(),
+            writer.memory_size()
+        );
 
         // in progress tracking is cleared, but the overall data written is updated
         let pre_flush_bytes_written = writer.bytes_written();
         writer.flush().await.unwrap();
         assert_eq!(writer.in_progress_size(), 0);
+        assert_eq!(writer.memory_size(), 0);
         assert_eq!(writer.in_progress_rows(), 0);
         assert!(writer.bytes_written() > pre_flush_bytes_written);
 

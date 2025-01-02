@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Interleave elements from multiple arrays
+
 use crate::dictionary::{merge_dictionary_values, should_merge_dictionary_values};
 use arrow_array::builder::{BooleanBufferBuilder, BufferBuilder, PrimitiveBuilder};
 use arrow_array::cast::AsArray;
@@ -63,7 +65,7 @@ macro_rules! dict_helper {
 ///   values array 1
 /// ```
 ///
-/// For selecting values by index from a single array see [`crate::interleave`]
+/// For selecting values by index from a single array see [`crate::take`]
 pub fn interleave(
     values: &[&dyn Array],
     indices: &[(usize, usize)],
@@ -261,6 +263,67 @@ fn interleave_fallback(
     // emit final batch of rows
     array_data.extend(cur_array, start_row_idx, end_row_idx);
     Ok(make_array(array_data.freeze()))
+}
+
+/// Interleave rows by index from multiple [`RecordBatch`] instances and return a new [`RecordBatch`].
+///
+/// This function will call [`interleave`] on each array of the [`RecordBatch`] instances and assemble a new [`RecordBatch`].
+///
+/// # Example
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::{StringArray, Int32Array, RecordBatch, UInt32Array};
+/// # use arrow_schema::{DataType, Field, Schema};
+/// # use arrow_select::interleave::interleave_record_batch;
+///
+/// let schema = Arc::new(Schema::new(vec![
+///     Field::new("a", DataType::Int32, true),
+///     Field::new("b", DataType::Utf8, true),
+/// ]));
+///
+/// let batch1 = RecordBatch::try_new(
+///     schema.clone(),
+///     vec![
+///         Arc::new(Int32Array::from(vec![0, 1, 2])),
+///         Arc::new(StringArray::from(vec!["a", "b", "c"])),
+///     ],
+/// ).unwrap();
+///
+/// let batch2 = RecordBatch::try_new(
+///     schema.clone(),
+///     vec![
+///         Arc::new(Int32Array::from(vec![3, 4, 5])),
+///         Arc::new(StringArray::from(vec!["d", "e", "f"])),
+///     ],
+/// ).unwrap();
+///
+/// let indices = vec![(0, 1), (1, 2), (0, 0), (1, 1)];
+/// let interleaved = interleave_record_batch(&[&batch1, &batch2], &indices).unwrap();
+///
+/// let expected = RecordBatch::try_new(
+///     schema,
+///     vec![
+///         Arc::new(Int32Array::from(vec![1, 5, 0, 4])),
+///         Arc::new(StringArray::from(vec!["b", "f", "a", "e"])),
+///     ],
+/// ).unwrap();
+/// assert_eq!(interleaved, expected);
+/// ```
+pub fn interleave_record_batch(
+    record_batches: &[&RecordBatch],
+    indices: &[(usize, usize)],
+) -> Result<RecordBatch, ArrowError> {
+    let schema = record_batches[0].schema();
+    let columns = (0..schema.fields().len())
+        .map(|i| {
+            let column_values: Vec<&dyn Array> = record_batches
+                .iter()
+                .map(|batch| batch.column(i).as_ref())
+                .collect();
+            interleave(&column_values, indices)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(schema, columns)
 }
 
 #[cfg(test)]

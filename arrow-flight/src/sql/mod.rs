@@ -43,11 +43,19 @@ use bytes::Bytes;
 use paste::paste;
 use prost::Message;
 
+#[allow(clippy::all)]
 mod gen {
-    #![allow(clippy::all)]
+    #![allow(rustdoc::unportable_markdown)]
+    // Since this file is auto-generated, we suppress all warnings
+    #![allow(missing_docs)]
     include!("arrow.flight.protocol.sql.rs");
 }
 
+pub use gen::action_end_transaction_request::EndTransaction;
+pub use gen::command_statement_ingest::table_definition_options::{
+    TableExistsOption, TableNotExistOption,
+};
+pub use gen::command_statement_ingest::TableDefinitionOptions;
 pub use gen::ActionBeginSavepointRequest;
 pub use gen::ActionBeginSavepointResult;
 pub use gen::ActionBeginTransactionRequest;
@@ -72,6 +80,7 @@ pub use gen::CommandGetTables;
 pub use gen::CommandGetXdbcTypeInfo;
 pub use gen::CommandPreparedStatementQuery;
 pub use gen::CommandPreparedStatementUpdate;
+pub use gen::CommandStatementIngest;
 pub use gen::CommandStatementQuery;
 pub use gen::CommandStatementSubstraitPlan;
 pub use gen::CommandStatementUpdate;
@@ -156,7 +165,9 @@ macro_rules! prost_message_ext {
                 /// ```
                 #[derive(Clone, Debug, PartialEq)]
                 pub enum Command {
-                    $($name($name),)*
+                    $(
+                        #[doc = concat!(stringify!($name), "variant")]
+                        $name($name),)*
 
                     /// Any message that is not any FlightSQL command.
                     Unknown(Any),
@@ -248,11 +259,12 @@ prost_message_ext!(
     CommandGetXdbcTypeInfo,
     CommandPreparedStatementQuery,
     CommandPreparedStatementUpdate,
+    CommandStatementIngest,
     CommandStatementQuery,
     CommandStatementSubstraitPlan,
     CommandStatementUpdate,
-    DoPutUpdateResult,
     DoPutPreparedStatementResult,
+    DoPutUpdateResult,
     TicketStatementQuery,
 );
 
@@ -289,10 +301,12 @@ pub struct Any {
 }
 
 impl Any {
+    /// Checks whether the message is of type `M`
     pub fn is<M: ProstMessageExt>(&self) -> bool {
         M::type_url() == self.type_url
     }
 
+    /// Unpacks the contents of the message if it is of type `M`
     pub fn unpack<M: ProstMessageExt>(&self) -> Result<Option<M>, ArrowError> {
         if !self.is::<M>() {
             return Ok(None);
@@ -302,6 +316,7 @@ impl Any {
         Ok(Some(m))
     }
 
+    /// Packs a message into an [`Any`] message
     pub fn pack<M: ProstMessageExt>(message: &M) -> Result<Any, ArrowError> {
         Ok(message.as_any())
     }

@@ -34,13 +34,21 @@ pub(crate) mod decoder;
 
 /// Column reader for a Parquet type.
 pub enum ColumnReader {
+    /// Column reader for boolean type
     BoolColumnReader(ColumnReaderImpl<BoolType>),
+    /// Column reader for int32 type
     Int32ColumnReader(ColumnReaderImpl<Int32Type>),
+    /// Column reader for int64 type
     Int64ColumnReader(ColumnReaderImpl<Int64Type>),
+    /// Column reader for int96 type
     Int96ColumnReader(ColumnReaderImpl<Int96Type>),
+    /// Column reader for float type
     FloatColumnReader(ColumnReaderImpl<FloatType>),
+    /// Column reader for double type
     DoubleColumnReader(ColumnReaderImpl<DoubleType>),
+    /// Column reader for byte array type
     ByteArrayColumnReader(ColumnReaderImpl<ByteArrayType>),
+    /// Column reader for fixed length byte array type
     FixedLenByteArrayColumnReader(ColumnReaderImpl<FixedLenByteArrayType>),
 }
 
@@ -240,6 +248,12 @@ where
                     let (mut records_read, levels_read) =
                         reader.read_rep_levels(out, remaining_records, remaining_levels)?;
 
+                    if records_read == 0 && levels_read == 0 {
+                        // The fact that we're still looping implies there must be some levels to read.
+                        return Err(general_err!(
+                            "Insufficient repetition levels read from column"
+                        ));
+                    }
                     if levels_read == remaining_levels && self.has_record_delimiter {
                         // Reached end of page, which implies records_read < remaining_records
                         // as otherwise would have stopped reading before reaching the end

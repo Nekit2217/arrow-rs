@@ -612,13 +612,13 @@ mod tests {
     fn test_string_dictionary_merge() {
         let mut builder = StringDictionaryBuilder::<Int32Type>::new();
         for i in 0..20 {
-            builder.append(&i.to_string()).unwrap();
+            builder.append(i.to_string()).unwrap();
         }
         let input_1 = builder.finish();
 
         let mut builder = StringDictionaryBuilder::<Int32Type>::new();
         for i in 0..30 {
-            builder.append(&i.to_string()).unwrap();
+            builder.append(i.to_string()).unwrap();
         }
         let input_2 = builder.finish();
 
@@ -849,5 +849,6 @@ mod tests {
         let dict_b = DictionaryArray::new(keys, Arc::new(values));
         let array = concat(&[&dict_a, &dict_b]).unwrap();
         assert_eq!(array.null_count(), 10);
+        assert_eq!(array.logical_null_count(), 10);
     }
 }

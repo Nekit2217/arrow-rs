@@ -138,7 +138,17 @@ impl TreeBuilder {
                 .column_descr_ptr();
             let col_reader = row_group_reader.get_column_reader(orig_index)?;
             let column = TripletIter::new(col_descr, col_reader, self.batch_size);
-            Reader::PrimitiveReader(field, Box::new(column))
+            let reader = Reader::PrimitiveReader(field.clone(), Box::new(column));
+            if repetition == Repetition::REPEATED {
+                Reader::RepeatedReader(
+                    field,
+                    curr_def_level - 1,
+                    curr_rep_level - 1,
+                    Box::new(reader),
+                )
+            } else {
+                reader
+            }
         } else {
             match field.get_basic_info().converted_type() {
                 // List types
@@ -304,18 +314,18 @@ impl TreeBuilder {
 
 /// Reader tree for record assembly
 pub enum Reader {
-    // Primitive reader with type information and triplet iterator
+    /// Primitive reader with type information and triplet iterator
     PrimitiveReader(TypePtr, Box<TripletIter>),
-    // Optional reader with definition level of a parent and a reader
+    /// Optional reader with definition level of a parent and a reader
     OptionReader(i16, Box<Reader>),
-    // Group (struct) reader with type information, definition level and list of child
-    // readers. When it represents message type, type information is None
+    /// Group (struct) reader with type information, definition level and list of child
+    /// readers. When it represents message type, type information is None
     GroupReader(Option<TypePtr>, i16, Vec<Reader>),
-    // Reader for repeated values, e.g. lists, contains type information, definition
-    // level, repetition level and a child reader
+    /// Reader for repeated values, e.g. lists, contains type information, definition
+    /// level, repetition level and a child reader
     RepeatedReader(TypePtr, i16, i16, Box<Reader>),
-    // Reader of key-value pairs, e.g. maps, contains type information, definition
-    // level, repetition level, child reader for keys and child reader for values
+    /// Reader of key-value pairs, e.g. maps, contains type information, definition
+    /// level, repetition level, child reader for keys and child reader for values
     KeyValueReader(TypePtr, i16, i16, Box<Reader>, Box<Reader>),
 }
 
@@ -592,7 +602,7 @@ enum Either<'a> {
     Right(Box<dyn FileReader>),
 }
 
-impl<'a> Either<'a> {
+impl Either<'_> {
     fn reader(&self) -> &dyn FileReader {
         match *self {
             Either::Left(r) => r,
@@ -732,7 +742,7 @@ impl<'a> RowIter<'a> {
     }
 }
 
-impl<'a> Iterator for RowIter<'a> {
+impl Iterator for RowIter<'_> {
     type Item = Result<Row>;
 
     fn next(&mut self) -> Option<Result<Row>> {
@@ -1685,6 +1695,131 @@ mod tests {
             )],
         ];
 
+        assert_eq!(rows, expected_rows);
+    }
+
+    #[test]
+    fn test_tree_reader_handle_primitive_repeated_fields_with_no_annotation() {
+        // In this test the REPEATED fields are primitives
+        let rows = test_file_reader_rows("repeated_primitive_no_list.parquet", None).unwrap();
+        let expected_rows = vec![
+            row![
+                (
+                    "Int32_list".to_string(),
+                    Field::ListInternal(make_list([0, 1, 2, 3].map(Field::Int).to_vec()))
+                ),
+                (
+                    "String_list".to_string(),
+                    Field::ListInternal(make_list(
+                        ["foo", "zero", "one", "two"]
+                            .map(|s| Field::Str(s.to_string()))
+                            .to_vec()
+                    ))
+                ),
+                (
+                    "group_of_lists".to_string(),
+                    group![
+                        (
+                            "Int32_list_in_group".to_string(),
+                            Field::ListInternal(make_list([0, 1, 2, 3].map(Field::Int).to_vec()))
+                        ),
+                        (
+                            "String_list_in_group".to_string(),
+                            Field::ListInternal(make_list(
+                                ["foo", "zero", "one", "two"]
+                                    .map(|s| Field::Str(s.to_string()))
+                                    .to_vec()
+                            ))
+                        )
+                    ]
+                )
+            ],
+            row![
+                (
+                    "Int32_list".to_string(),
+                    Field::ListInternal(make_list(vec![]))
+                ),
+                (
+                    "String_list".to_string(),
+                    Field::ListInternal(make_list(
+                        ["three"].map(|s| Field::Str(s.to_string())).to_vec()
+                    ))
+                ),
+                (
+                    "group_of_lists".to_string(),
+                    group![
+                        (
+                            "Int32_list_in_group".to_string(),
+                            Field::ListInternal(make_list(vec![]))
+                        ),
+                        (
+                            "String_list_in_group".to_string(),
+                            Field::ListInternal(make_list(
+                                ["three"].map(|s| Field::Str(s.to_string())).to_vec()
+                            ))
+                        )
+                    ]
+                )
+            ],
+            row![
+                (
+                    "Int32_list".to_string(),
+                    Field::ListInternal(make_list(vec![Field::Int(4)]))
+                ),
+                (
+                    "String_list".to_string(),
+                    Field::ListInternal(make_list(
+                        ["four"].map(|s| Field::Str(s.to_string())).to_vec()
+                    ))
+                ),
+                (
+                    "group_of_lists".to_string(),
+                    group![
+                        (
+                            "Int32_list_in_group".to_string(),
+                            Field::ListInternal(make_list(vec![Field::Int(4)]))
+                        ),
+                        (
+                            "String_list_in_group".to_string(),
+                            Field::ListInternal(make_list(
+                                ["four"].map(|s| Field::Str(s.to_string())).to_vec()
+                            ))
+                        )
+                    ]
+                )
+            ],
+            row![
+                (
+                    "Int32_list".to_string(),
+                    Field::ListInternal(make_list([5, 6, 7, 8].map(Field::Int).to_vec()))
+                ),
+                (
+                    "String_list".to_string(),
+                    Field::ListInternal(make_list(
+                        ["five", "six", "seven", "eight"]
+                            .map(|s| Field::Str(s.to_string()))
+                            .to_vec()
+                    ))
+                ),
+                (
+                    "group_of_lists".to_string(),
+                    group![
+                        (
+                            "Int32_list_in_group".to_string(),
+                            Field::ListInternal(make_list([5, 6, 7, 8].map(Field::Int).to_vec()))
+                        ),
+                        (
+                            "String_list_in_group".to_string(),
+                            Field::ListInternal(make_list(
+                                ["five", "six", "seven", "eight"]
+                                    .map(|s| Field::Str(s.to_string()))
+                                    .to_vec()
+                            ))
+                        )
+                    ]
+                )
+            ],
+        ];
         assert_eq!(rows, expected_rows);
     }
 

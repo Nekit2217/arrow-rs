@@ -44,12 +44,15 @@ use std::time::{Duration, Instant};
 use tracing::info;
 use url::Url;
 
-pub const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+pub(crate) const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
-pub const DEFAULT_GCS_BASE_URL: &str = "https://storage.googleapis.com";
+pub(crate) const DEFAULT_GCS_BASE_URL: &str = "https://storage.googleapis.com";
 
 const DEFAULT_GCS_PLAYLOAD_STRING: &str = "UNSIGNED-PAYLOAD";
 const DEFAULT_GCS_SIGN_BLOB_HOST: &str = "storage.googleapis.com";
+
+const DEFAULT_METADATA_HOST: &str = "metadata.google.internal";
+const DEFAULT_METADATA_IP: &str = "169.254.169.254";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -163,10 +166,10 @@ pub struct GcpCredential {
     pub bearer: String,
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Default, serde::Serialize)]
-pub struct JwtHeader<'a> {
+pub(crate) struct JwtHeader<'a> {
     /// The type of JWS: it can only be "JWT" here
     ///
     /// Defined in [RFC7515#4.1.9](https://tools.ietf.org/html/rfc7515#section-4.1.9).
@@ -223,7 +226,7 @@ struct TokenResponse {
 /// # References
 /// - <https://google.aip.dev/auth/4111>
 #[derive(Debug)]
-pub struct SelfSignedJwt {
+pub(crate) struct SelfSignedJwt {
     issuer: String,
     scope: String,
     private_key: ServiceAccountKey,
@@ -232,7 +235,7 @@ pub struct SelfSignedJwt {
 
 impl SelfSignedJwt {
     /// Create a new [`SelfSignedJwt`]
-    pub fn new(
+    pub(crate) fn new(
         key_id: String,
         issuer: String,
         private_key: ServiceAccountKey,
@@ -311,7 +314,7 @@ where
 
 /// A deserialized `service-account-********.json`-file.
 #[derive(serde::Deserialize, Debug, Clone)]
-pub struct ServiceAccountCredentials {
+pub(crate) struct ServiceAccountCredentials {
     /// The private key in RSA format.
     pub private_key: String,
 
@@ -332,12 +335,12 @@ pub struct ServiceAccountCredentials {
 
 impl ServiceAccountCredentials {
     /// Create a new [`ServiceAccountCredentials`] from a file.
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub(crate) fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         read_credentials_file(path)
     }
 
     /// Create a new [`ServiceAccountCredentials`] from a string.
-    pub fn from_key(key: &str) -> Result<Self> {
+    pub(crate) fn from_key(key: &str) -> Result<Self> {
         serde_json::from_str(key).context(DecodeCredentialsSnafu)
     }
 
@@ -349,7 +352,7 @@ impl ServiceAccountCredentials {
     /// # References
     /// - <https://stackoverflow.com/questions/63222450/service-account-authorization-without-oauth-can-we-get-file-from-google-cloud/71834557#71834557>
     /// - <https://www.codejam.info/2022/05/google-cloud-service-account-authorization-without-oauth.html>
-    pub fn token_provider(self) -> crate::Result<SelfSignedJwt> {
+    pub(crate) fn token_provider(self) -> crate::Result<SelfSignedJwt> {
         Ok(SelfSignedJwt::new(
             self.private_key_id,
             self.client_email,
@@ -358,7 +361,7 @@ impl ServiceAccountCredentials {
         )?)
     }
 
-    pub fn signing_credentials(self) -> crate::Result<GcpSigningCredentialProvider> {
+    pub(crate) fn signing_credentials(self) -> crate::Result<GcpSigningCredentialProvider> {
         Ok(Arc::new(StaticCredentialProvider::new(
             GcpSigningCredential {
                 email: self.client_email,
@@ -385,7 +388,7 @@ fn b64_encode_obj<T: serde::Serialize>(obj: &T) -> Result<String> {
 ///
 /// <https://cloud.google.com/docs/authentication/get-id-token#metadata-server>
 #[derive(Debug, Default)]
-pub struct InstanceCredentialProvider {}
+pub(crate) struct InstanceCredentialProvider {}
 
 /// Make a request to the metadata server to fetch a token, using a a given hostname.
 async fn make_metadata_request(
@@ -414,17 +417,31 @@ impl TokenProvider for InstanceCredentialProvider {
 
     /// Fetch a token from the metadata server.
     /// Since the connection is local we need to enable http access and don't actually use the client object passed in.
+    /// Respects the `GCE_METADATA_HOST`, `GCE_METADATA_ROOT`, and `GCE_METADATA_IP`
+    /// environment variables.
+    ///  
+    /// References: <https://googleapis.dev/python/google-auth/latest/reference/google.auth.environment_vars.html>
     async fn fetch_token(
         &self,
         client: &Client,
         retry: &RetryConfig,
     ) -> crate::Result<TemporaryToken<Arc<GcpCredential>>> {
-        const METADATA_IP: &str = "169.254.169.254";
-        const METADATA_HOST: &str = "metadata";
+        let metadata_host = if let Ok(host) = env::var("GCE_METADATA_HOST") {
+            host
+        } else if let Ok(host) = env::var("GCE_METADATA_ROOT") {
+            host
+        } else {
+            DEFAULT_METADATA_HOST.to_string()
+        };
+        let metadata_ip = if let Ok(ip) = env::var("GCE_METADATA_IP") {
+            ip
+        } else {
+            DEFAULT_METADATA_IP.to_string()
+        };
 
         info!("fetching token from metadata server");
-        let response = make_metadata_request(client, METADATA_HOST, retry)
-            .or_else(|_| make_metadata_request(client, METADATA_IP, retry))
+        let response = make_metadata_request(client, &metadata_host, retry)
+            .or_else(|_| make_metadata_request(client, &metadata_ip, retry))
             .await?;
 
         let token = TemporaryToken {
@@ -461,7 +478,7 @@ async fn make_metadata_request_for_email(
 ///
 /// <https://cloud.google.com/appengine/docs/legacy/standard/java/accessing-instance-metadata>
 #[derive(Debug, Default)]
-pub struct InstanceSigningCredentialProvider {}
+pub(crate) struct InstanceSigningCredentialProvider {}
 
 #[async_trait]
 impl TokenProvider for InstanceSigningCredentialProvider {
@@ -469,18 +486,33 @@ impl TokenProvider for InstanceSigningCredentialProvider {
 
     /// Fetch a token from the metadata server.
     /// Since the connection is local we need to enable http access and don't actually use the client object passed in.
+    /// Respects the `GCE_METADATA_HOST`, `GCE_METADATA_ROOT`, and `GCE_METADATA_IP`
+    /// environment variables.
+    ///  
+    /// References: <https://googleapis.dev/python/google-auth/latest/reference/google.auth.environment_vars.html>
     async fn fetch_token(
         &self,
         client: &Client,
         retry: &RetryConfig,
     ) -> crate::Result<TemporaryToken<Arc<GcpSigningCredential>>> {
-        const METADATA_IP: &str = "169.254.169.254";
-        const METADATA_HOST: &str = "metadata";
+        let metadata_host = if let Ok(host) = env::var("GCE_METADATA_HOST") {
+            host
+        } else if let Ok(host) = env::var("GCE_METADATA_ROOT") {
+            host
+        } else {
+            DEFAULT_METADATA_HOST.to_string()
+        };
+
+        let metadata_ip = if let Ok(ip) = env::var("GCE_METADATA_IP") {
+            ip
+        } else {
+            DEFAULT_METADATA_IP.to_string()
+        };
 
         info!("fetching token from metadata server");
 
-        let email = make_metadata_request_for_email(client, METADATA_HOST, retry)
-            .or_else(|_| make_metadata_request_for_email(client, METADATA_IP, retry))
+        let email = make_metadata_request_for_email(client, &metadata_host, retry)
+            .or_else(|_| make_metadata_request_for_email(client, &metadata_ip, retry))
             .await?;
 
         let token = TemporaryToken {
@@ -501,7 +533,7 @@ impl TokenProvider for InstanceSigningCredentialProvider {
 /// - <https://google.aip.dev/auth/4110>
 #[derive(serde::Deserialize, Clone)]
 #[serde(tag = "type")]
-pub enum ApplicationDefaultCredentials {
+pub(crate) enum ApplicationDefaultCredentials {
     /// Service Account.
     ///
     /// # References
@@ -526,7 +558,7 @@ impl ApplicationDefaultCredentials {
     // Create a new application default credential in the following situations:
     //  1. a file is passed in and the type matches.
     //  2. without argument if the well-known configuration file is present.
-    pub fn read(path: Option<&str>) -> Result<Option<Self>, Error> {
+    pub(crate) fn read(path: Option<&str>) -> Result<Option<Self>, Error> {
         if let Some(path) = path {
             return read_credentials_file::<Self>(path).map(Some);
         }
@@ -548,14 +580,14 @@ const DEFAULT_TOKEN_GCP_URI: &str = "https://accounts.google.com/o/oauth2/token"
 
 /// <https://google.aip.dev/auth/4113>
 #[derive(Debug, Deserialize, Clone)]
-pub struct AuthorizedUserCredentials {
+pub(crate) struct AuthorizedUserCredentials {
     client_id: String,
     client_secret: String,
     refresh_token: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AuthorizedUserSigningCredentials {
+pub(crate) struct AuthorizedUserSigningCredentials {
     credential: AuthorizedUserCredentials,
 }
 
@@ -566,7 +598,7 @@ struct EmailResponse {
 }
 
 impl AuthorizedUserSigningCredentials {
-    pub fn from(credential: AuthorizedUserCredentials) -> crate::Result<Self> {
+    pub(crate) fn from(credential: AuthorizedUserCredentials) -> crate::Result<Self> {
         Ok(Self { credential })
     }
 
@@ -652,14 +684,14 @@ fn trim_header_value(value: &str) -> String {
 ///
 /// [Google SigV4]: https://cloud.google.com/storage/docs/access-control/signed-urls
 #[derive(Debug)]
-pub struct GCSAuthorizer {
+pub(crate) struct GCSAuthorizer {
     date: Option<DateTime<Utc>>,
     credential: Arc<GcpSigningCredential>,
 }
 
 impl GCSAuthorizer {
     /// Create a new [`GCSAuthorizer`]
-    pub fn new(credential: Arc<GcpSigningCredential>) -> Self {
+    pub(crate) fn new(credential: Arc<GcpSigningCredential>) -> Self {
         Self {
             date: None,
             credential,
@@ -789,7 +821,7 @@ impl GCSAuthorizer {
     ///```
     ///`ACTIVE_DATETIME` format:`YYYYMMDD'T'HHMMSS'Z'`
     /// <https://cloud.google.com/storage/docs/authentication/signatures#string-to-sign>
-    pub fn string_to_sign(
+    pub(crate) fn string_to_sign(
         &self,
         date: DateTime<Utc>,
         request_method: &Method,

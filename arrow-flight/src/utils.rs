@@ -94,7 +94,7 @@ pub fn flight_data_to_arrow_batch(
         })
         .map(|batch| {
             reader::read_record_batch(
-                &Buffer::from(&data.data_body),
+                &Buffer::from(data.data_body.as_ref()),
                 batch,
                 schema,
                 dictionaries_by_id,
@@ -160,9 +160,12 @@ pub fn batches_to_flight_data(
         dictionaries.extend(encoded_dictionaries.into_iter().map(Into::into));
         flight_data.push(encoded_batch.into());
     }
-    let mut stream = vec![schema_flight_data];
+
+    let mut stream = Vec::with_capacity(1 + dictionaries.len() + flight_data.len());
+
+    stream.push(schema_flight_data);
     stream.extend(dictionaries);
     stream.extend(flight_data);
-    let flight_data: Vec<_> = stream.into_iter().collect();
+    let flight_data = stream;
     Ok(flight_data)
 }

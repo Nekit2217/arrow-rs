@@ -480,6 +480,7 @@ pub async fn put_get_attributes(integration: &dyn ObjectStore) {
         (Attribute::ContentEncoding, "gzip"),
         (Attribute::ContentLanguage, "en-US"),
         (Attribute::ContentType, "text/html; charset=utf-8"),
+        (Attribute::Metadata("test_key".into()), "test_value"),
     ]);
 
     let path = Path::from("attributes");
@@ -650,6 +651,12 @@ pub async fn put_opts(storage: &dyn ObjectStore, supports_update: bool) {
     assert_eq!(b.as_ref(), b"a");
 
     if !supports_update {
+        let err = storage
+            .put_opts(&path, "c".into(), PutMode::Update(v1.clone().into()).into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotImplemented { .. }), "{err}");
+
         return;
     }
 

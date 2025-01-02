@@ -19,6 +19,7 @@ use arrow_flight::sql::server::PeekableFlightDataStream;
 use arrow_flight::sql::DoPutPreparedStatementResult;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use core::str;
 use futures::{stream, Stream, TryStreamExt};
 use once_cell::sync::Lazy;
 use prost::Message;
@@ -46,9 +47,9 @@ use arrow_flight::sql::{
     ActionEndTransactionRequest, Any, CommandGetCatalogs, CommandGetCrossReference,
     CommandGetDbSchemas, CommandGetExportedKeys, CommandGetImportedKeys, CommandGetPrimaryKeys,
     CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables, CommandGetXdbcTypeInfo,
-    CommandPreparedStatementQuery, CommandPreparedStatementUpdate, CommandStatementQuery,
-    CommandStatementSubstraitPlan, CommandStatementUpdate, Nullable, ProstMessageExt, Searchable,
-    SqlInfo, TicketStatementQuery, XdbcDataType,
+    CommandPreparedStatementQuery, CommandPreparedStatementUpdate, CommandStatementIngest,
+    CommandStatementQuery, CommandStatementSubstraitPlan, CommandStatementUpdate, Nullable,
+    ProstMessageExt, Searchable, SqlInfo, TicketStatementQuery, XdbcDataType,
 };
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
@@ -168,7 +169,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let bytes = BASE64_STANDARD
             .decode(base64)
             .map_err(|e| status!("authorization not decodable", e))?;
-        let str = String::from_utf8(bytes).map_err(|e| status!("authorization not parsable", e))?;
+        let str = str::from_utf8(&bytes).map_err(|e| status!("authorization not parsable", e))?;
         let parts: Vec<_> = str.split(':').collect();
         let (user, pass) = match parts.as_slice() {
             [user, pass] => (user, pass),
@@ -615,6 +616,14 @@ impl FlightSqlService for FlightSqlServiceImpl {
         Ok(FAKE_UPDATE_RESULT)
     }
 
+    async fn do_put_statement_ingest(
+        &self,
+        _ticket: CommandStatementIngest,
+        _request: Request<PeekableFlightDataStream>,
+    ) -> Result<i64, Status> {
+        Ok(FAKE_UPDATE_RESULT)
+    }
+
     async fn do_put_substrait_plan(
         &self,
         _ticket: CommandStatementSubstraitPlan,
@@ -783,10 +792,12 @@ impl ProstMessageExt for FetchResults {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::TryStreamExt;
+    use futures::{TryFutureExt, TryStreamExt};
+    use hyper_util::rt::TokioIo;
     use std::fs;
     use std::future::Future;
     use std::net::SocketAddr;
+    use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::NamedTempFile;
     use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -843,7 +854,8 @@ mod tests {
             .serve_with_incoming(stream);
 
         let request_future = async {
-            let connector = service_fn(move |_| UnixStream::connect(path.clone()));
+            let connector =
+                service_fn(move |_| UnixStream::connect(path.clone()).map_ok(TokioIo::new));
             let channel = Endpoint::try_from("http://example.com")
                 .unwrap()
                 .connect_with_connector(connector)
@@ -890,13 +902,15 @@ mod tests {
         F: FnOnce(FlightSqlServiceClient<Channel>) -> C,
         C: Future<Output = ()>,
     {
-        let cert = std::fs::read_to_string("examples/data/server.pem").unwrap();
-        let key = std::fs::read_to_string("examples/data/server.key").unwrap();
-        let client_ca = std::fs::read_to_string("examples/data/client_ca.pem").unwrap();
+        let cert_dir = PathBuf::from("examples/data");
+
+        let cert = std::fs::read_to_string(cert_dir.join("server.pem")).unwrap();
+        let key = std::fs::read_to_string(cert_dir.join("server.key")).unwrap();
+        let ca_root = std::fs::read_to_string(cert_dir.join("ca_root.pem")).unwrap();
 
         let tls_config = ServerTlsConfig::new()
             .identity(Identity::from_pem(&cert, &key))
-            .client_ca_root(Certificate::from_pem(&client_ca));
+            .client_ca_root(Certificate::from_pem(&ca_root));
 
         let (incoming, addr) = bind_tcp().await;
         let uri = format!("https://{}:{}", addr.ip(), addr.port());
@@ -909,14 +923,13 @@ mod tests {
             .add_service(svc)
             .serve_with_incoming(incoming);
 
-        let request_future = async {
-            let cert = std::fs::read_to_string("examples/data/client1.pem").unwrap();
-            let key = std::fs::read_to_string("examples/data/client1.key").unwrap();
-            let server_ca = std::fs::read_to_string("examples/data/ca.pem").unwrap();
+        let request_future = async move {
+            let cert = std::fs::read_to_string(cert_dir.join("client.pem")).unwrap();
+            let key = std::fs::read_to_string(cert_dir.join("client.key")).unwrap();
 
             let tls_config = ClientTlsConfig::new()
                 .domain_name("localhost")
-                .ca_certificate(Certificate::from_pem(&server_ca))
+                .ca_certificate(Certificate::from_pem(&ca_root))
                 .identity(Identity::from_pem(cert, key));
 
             let endpoint = endpoint(uri).unwrap().tls_config(tls_config).unwrap();
@@ -993,30 +1006,36 @@ mod tests {
     async fn test_auth() {
         test_all_clients(|mut client| async move {
             // no handshake
-            assert!(client
-                .prepare("select 1;".to_string(), None)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("No authorization header"));
+            assert_contains(
+                client
+                    .prepare("select 1;".to_string(), None)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "No authorization header",
+            );
 
             // Invalid credentials
-            assert!(client
-                .handshake("admin", "password2")
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("Invalid credentials"));
+            assert_contains(
+                client
+                    .handshake("admin", "password2")
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "Invalid credentials",
+            );
 
             // Invalid Tokens
             client.handshake("admin", "password").await.unwrap();
             client.set_token("wrong token".to_string());
-            assert!(client
-                .prepare("select 1;".to_string(), None)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("invalid token"));
+            assert_contains(
+                client
+                    .prepare("select 1;".to_string(), None)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "invalid token",
+            );
 
             client.clear_token();
 
@@ -1025,5 +1044,16 @@ mod tests {
             client.prepare("select 1;".to_string(), None).await.unwrap();
         })
         .await
+    }
+
+    fn assert_contains(actual: impl AsRef<str>, searched_for: impl AsRef<str>) {
+        let actual = actual.as_ref();
+        let searched_for = searched_for.as_ref();
+        assert!(
+            actual.contains(searched_for),
+            "Expected '{}' to contain '{}'",
+            actual,
+            searched_for
+        );
     }
 }

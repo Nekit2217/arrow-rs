@@ -28,8 +28,8 @@ use crate::client::header::{get_put_result, get_version};
 use crate::client::list::ListClient;
 use crate::client::retry::RetryExt;
 use crate::client::s3::{
-    CompleteMultipartUpload, CompleteMultipartUploadResult, InitiateMultipartUploadResult,
-    ListResponse,
+    CompleteMultipartUpload, CompleteMultipartUploadResult, CopyPartResult,
+    InitiateMultipartUploadResult, ListResponse,
 };
 use crate::client::GetOptionsExt;
 use crate::multipart::PartId;
@@ -61,10 +61,10 @@ use std::sync::Arc;
 
 const VERSION_HEADER: &str = "x-amz-version-id";
 const SHA256_CHECKSUM: &str = "x-amz-checksum-sha256";
+const USER_DEFINED_METADATA_HEADER_PREFIX: &str = "x-amz-meta-";
 
 /// A specialized `Error` for object store-related errors
 #[derive(Debug, Snafu)]
-#[allow(missing_docs)]
 pub(crate) enum Error {
     #[snafu(display("Error performing DeleteObjects request: {}", source))]
     DeleteObjectsRequest { source: crate::client::retry::Error },
@@ -98,8 +98,11 @@ pub(crate) enum Error {
     #[snafu(display("Error getting create multipart response body: {}", source))]
     CreateMultipartResponseBody { source: reqwest::Error },
 
-    #[snafu(display("Error performing complete multipart request: {}", source))]
-    CompleteMultipartRequest { source: crate::client::retry::Error },
+    #[snafu(display("Error performing complete multipart request: {}: {}", path, source))]
+    CompleteMultipartRequest {
+        source: crate::client::retry::Error,
+        path: String,
+    },
 
     #[snafu(display("Error getting complete multipart response body: {}", source))]
     CompleteMultipartResponseBody { source: reqwest::Error },
@@ -118,11 +121,30 @@ pub(crate) enum Error {
 
 impl From<Error> for crate::Error {
     fn from(err: Error) -> Self {
-        Self::Generic {
-            store: STORE,
-            source: Box::new(err),
+        match err {
+            Error::CompleteMultipartRequest { source, path } => source.error(STORE, path),
+            _ => Self::Generic {
+                store: STORE,
+                source: Box::new(err),
+            },
         }
     }
+}
+
+pub(crate) enum PutPartPayload<'a> {
+    Part(PutPayload),
+    Copy(&'a Path),
+}
+
+impl Default for PutPartPayload<'_> {
+    fn default() -> Self {
+        Self::Part(PutPayload::default())
+    }
+}
+
+pub(crate) enum CompleteMultipartMode {
+    Overwrite,
+    Create,
 }
 
 #[derive(Deserialize)]
@@ -165,7 +187,7 @@ impl From<DeleteError> for Error {
 }
 
 #[derive(Debug)]
-pub struct S3Config {
+pub(crate) struct S3Config {
     pub region: String,
     pub endpoint: Option<String>,
     pub bucket: String,
@@ -180,7 +202,7 @@ pub struct S3Config {
     pub checksum: Option<Checksum>,
     pub copy_if_not_exists: Option<S3CopyIfNotExists>,
     pub conditional_put: Option<S3ConditionalPut>,
-    pub encryption_headers: S3EncryptionHeaders,
+    pub(super) encryption_headers: S3EncryptionHeaders,
 }
 
 impl S3Config {
@@ -266,15 +288,16 @@ pub(crate) struct Request<'a> {
     payload: Option<PutPayload>,
     use_session_creds: bool,
     idempotent: bool,
+    retry_error_body: bool,
 }
 
 impl<'a> Request<'a> {
-    pub fn query<T: Serialize + ?Sized + Sync>(self, query: &T) -> Self {
+    pub(crate) fn query<T: Serialize + ?Sized + Sync>(self, query: &T) -> Self {
         let builder = self.builder.query(query);
         Self { builder, ..self }
     }
 
-    pub fn header<K>(self, k: K, v: &str) -> Self
+    pub(crate) fn header<K>(self, k: K, v: &str) -> Self
     where
         HeaderName: TryFrom<K>,
         <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
@@ -283,29 +306,36 @@ impl<'a> Request<'a> {
         Self { builder, ..self }
     }
 
-    pub fn headers(self, headers: HeaderMap) -> Self {
+    pub(crate) fn headers(self, headers: HeaderMap) -> Self {
         let builder = self.builder.headers(headers);
         Self { builder, ..self }
     }
 
-    pub fn idempotent(self, idempotent: bool) -> Self {
+    pub(crate) fn idempotent(self, idempotent: bool) -> Self {
         Self { idempotent, ..self }
     }
 
-    pub fn with_encryption_headers(self) -> Self {
+    pub(crate) fn retry_error_body(self, retry_error_body: bool) -> Self {
+        Self {
+            retry_error_body,
+            ..self
+        }
+    }
+
+    pub(crate) fn with_encryption_headers(self) -> Self {
         let headers = self.config.encryption_headers.clone().into();
         let builder = self.builder.headers(headers);
         Self { builder, ..self }
     }
 
-    pub fn with_session_creds(self, use_session_creds: bool) -> Self {
+    pub(crate) fn with_session_creds(self, use_session_creds: bool) -> Self {
         Self {
             use_session_creds,
             ..self
         }
     }
 
-    pub fn with_tags(mut self, tags: TagSet) -> Self {
+    pub(crate) fn with_tags(mut self, tags: TagSet) -> Self {
         let tags = tags.encoded();
         if !tags.is_empty() && !self.config.disable_tagging {
             self.builder = self.builder.header(&TAGS_HEADER, tags);
@@ -313,7 +343,7 @@ impl<'a> Request<'a> {
         self
     }
 
-    pub fn with_attributes(self, attributes: Attributes) -> Self {
+    pub(crate) fn with_attributes(self, attributes: Attributes) -> Self {
         let mut has_content_type = false;
         let mut builder = self.builder;
         for (k, v) in &attributes {
@@ -326,6 +356,10 @@ impl<'a> Request<'a> {
                     has_content_type = true;
                     builder.header(CONTENT_TYPE, v.as_ref())
                 }
+                Attribute::Metadata(k_suffix) => builder.header(
+                    &format!("{}{}", USER_DEFINED_METADATA_HEADER_PREFIX, k_suffix),
+                    v.as_ref(),
+                ),
             };
         }
 
@@ -337,8 +371,10 @@ impl<'a> Request<'a> {
         Self { builder, ..self }
     }
 
-    pub fn with_payload(mut self, payload: PutPayload) -> Self {
-        if !self.config.skip_signature || self.config.checksum.is_some() {
+    pub(crate) fn with_payload(mut self, payload: PutPayload) -> Self {
+        if (!self.config.skip_signature && self.config.sign_payload)
+            || self.config.checksum.is_some()
+        {
             let mut sha256 = Context::new(&digest::SHA256);
             payload.iter().for_each(|x| sha256.update(x));
             let payload_sha256 = sha256.finish();
@@ -358,7 +394,7 @@ impl<'a> Request<'a> {
         self
     }
 
-    pub async fn send(self) -> Result<Response, RequestError> {
+    pub(crate) async fn send(self) -> Result<Response, RequestError> {
         let credential = match self.use_session_creds {
             true => self.config.get_session_credential().await?,
             false => SessionCredential {
@@ -375,13 +411,14 @@ impl<'a> Request<'a> {
             .with_aws_sigv4(credential.authorizer(), sha)
             .retryable(&self.config.retry_config)
             .idempotent(self.idempotent)
+            .retry_error_body(self.retry_error_body)
             .payload(self.payload)
             .send()
             .await
             .context(RetrySnafu { path })
     }
 
-    pub async fn do_put(self) -> Result<PutResult> {
+    pub(crate) async fn do_put(self) -> Result<PutResult> {
         let response = self.send().await?;
         Ok(get_put_result(response.headers(), VERSION_HEADER).context(MetadataSnafu)?)
     }
@@ -394,7 +431,7 @@ pub(crate) struct S3Client {
 }
 
 impl S3Client {
-    pub fn new(config: S3Config) -> Result<Self> {
+    pub(crate) fn new(config: S3Config) -> Result<Self> {
         let client = config.client_options.clone()
             .with_connect_timeout_disabled()
             .with_timeout_disabled()
@@ -402,7 +439,7 @@ impl S3Client {
         Ok(Self { config, client })
     }
 
-    pub fn request<'a>(&'a self, method: Method, path: &'a Path) -> Request<'a> {
+    pub(crate) fn request<'a>(&'a self, method: Method, path: &'a Path) -> Request<'a> {
         let url = self.config.path_url(path);
         Request {
             path,
@@ -412,6 +449,7 @@ impl S3Client {
             config: &self.config,
             use_session_creds: true,
             idempotent: false,
+            retry_error_body: false,
         }
     }
 
@@ -422,7 +460,7 @@ impl S3Client {
     /// there was an error for a certain path, the error will be returned in the
     /// vector. If there was an issue with making the overall request, an error
     /// will be returned at the top level.
-    pub async fn bulk_delete_request(&self, paths: Vec<Path>) -> Result<Vec<Result<Path>>> {
+    pub(crate) async fn bulk_delete_request(&self, paths: Vec<Path>) -> Result<Vec<Result<Path>>> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -518,16 +556,54 @@ impl S3Client {
     }
 
     /// Make an S3 Copy request <https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html>
-    pub fn copy_request<'a>(&'a self, from: &Path, to: &'a Path) -> Request<'a> {
+    pub(crate) fn copy_request<'a>(&'a self, from: &Path, to: &'a Path) -> Request<'a> {
         let source = format!("{}/{}", self.config.bucket, encode_path(from));
+
+        let mut copy_source_encryption_headers = HeaderMap::new();
+        if let Some(customer_algorithm) = self
+            .config
+            .encryption_headers
+            .0
+            .get("x-amz-server-side-encryption-customer-algorithm")
+        {
+            copy_source_encryption_headers.insert(
+                "x-amz-copy-source-server-side-encryption-customer-algorithm",
+                customer_algorithm.clone(),
+            );
+        }
+        if let Some(customer_key) = self
+            .config
+            .encryption_headers
+            .0
+            .get("x-amz-server-side-encryption-customer-key")
+        {
+            copy_source_encryption_headers.insert(
+                "x-amz-copy-source-server-side-encryption-customer-key",
+                customer_key.clone(),
+            );
+        }
+        if let Some(customer_key_md5) = self
+            .config
+            .encryption_headers
+            .0
+            .get("x-amz-server-side-encryption-customer-key-MD5")
+        {
+            copy_source_encryption_headers.insert(
+                "x-amz-copy-source-server-side-encryption-customer-key-MD5",
+                customer_key_md5.clone(),
+            );
+        }
+
         self.request(Method::PUT, to)
             .idempotent(true)
+            .retry_error_body(true)
             .header(&COPY_SOURCE_HEADER, &source)
             .headers(self.config.encryption_headers.clone().into())
+            .headers(copy_source_encryption_headers)
             .with_session_creds(false)
     }
 
-    pub async fn create_multipart(
+    pub(crate) async fn create_multipart(
         &self,
         location: &Path,
         opts: PutMultipartOpts,
@@ -551,38 +627,82 @@ impl S3Client {
         Ok(response.upload_id)
     }
 
-    pub async fn put_part(
+    pub(crate) async fn put_part(
         &self,
         path: &Path,
         upload_id: &MultipartId,
         part_idx: usize,
-        data: PutPayload,
+        data: PutPartPayload<'_>,
     ) -> Result<PartId> {
+        let is_copy = matches!(data, PutPartPayload::Copy(_));
         let part = (part_idx + 1).to_string();
 
-        let response = self
+        let mut request = self
             .request(Method::PUT, path)
-            .with_payload(data)
             .query(&[("partNumber", &part), ("uploadId", upload_id)])
-            .idempotent(true)
-            .send()
-            .await?;
+            .idempotent(true);
 
-        let content_id = get_etag(response.headers()).context(MetadataSnafu)?;
+        request = match data {
+            PutPartPayload::Part(payload) => request.with_payload(payload),
+            PutPartPayload::Copy(path) => request.header(
+                "x-amz-copy-source",
+                &format!("{}/{}", self.config.bucket, encode_path(path)),
+            ),
+        };
+
+        if self
+            .config
+            .encryption_headers
+            .0
+            .contains_key("x-amz-server-side-encryption-customer-algorithm")
+        {
+            // If SSE-C is used, we must include the encryption headers in every upload request.
+            request = request.with_encryption_headers();
+        }
+        let response = request.send().await?;
+
+        let content_id = match is_copy {
+            false => get_etag(response.headers()).context(MetadataSnafu)?,
+            true => {
+                let response = response
+                    .bytes()
+                    .await
+                    .context(CreateMultipartResponseBodySnafu)?;
+                let response: CopyPartResult = quick_xml::de::from_reader(response.reader())
+                    .context(InvalidMultipartResponseSnafu)?;
+                response.e_tag
+            }
+        };
         Ok(PartId { content_id })
     }
 
-    pub async fn complete_multipart(
+    pub(crate) async fn abort_multipart(&self, location: &Path, upload_id: &str) -> Result<()> {
+        self.request(Method::DELETE, location)
+            .query(&[("uploadId", upload_id)])
+            .with_encryption_headers()
+            .send()
+            .await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn complete_multipart(
         &self,
         location: &Path,
         upload_id: &str,
         parts: Vec<PartId>,
+        mode: CompleteMultipartMode,
     ) -> Result<PutResult> {
         let parts = if parts.is_empty() {
             // If no parts were uploaded, upload an empty part
             // otherwise the completion request will fail
             let part = self
-                .put_part(location, &upload_id.to_string(), 0, PutPayload::default())
+                .put_part(
+                    location,
+                    &upload_id.to_string(),
+                    0,
+                    PutPartPayload::default(),
+                )
                 .await?;
             vec![part]
         } else {
@@ -594,17 +714,27 @@ impl S3Client {
         let credential = self.config.get_session_credential().await?;
         let url = self.config.path_url(location);
 
-        let response = self
+        let request = self
             .client
             .request(Method::POST, url)
             .query(&[("uploadId", upload_id)])
             .body(body)
-            .with_aws_sigv4(credential.authorizer(), None)
+            .with_aws_sigv4(credential.authorizer(), None);
+
+        let request = match mode {
+            CompleteMultipartMode::Overwrite => request,
+            CompleteMultipartMode::Create => request.header("If-None-Match", "*"),
+        };
+
+        let response = request
             .retryable(&self.config.retry_config)
             .idempotent(true)
+            .retry_error_body(true)
             .send()
             .await
-            .context(CompleteMultipartRequestSnafu)?;
+            .context(CompleteMultipartRequestSnafu {
+                path: location.as_ref(),
+            })?;
 
         let version = get_version(response.headers(), VERSION_HEADER).context(MetadataSnafu)?;
 
@@ -623,7 +753,7 @@ impl S3Client {
     }
 
     #[cfg(test)]
-    pub async fn get_object_tagging(&self, path: &Path) -> Result<Response> {
+    pub(crate) async fn get_object_tagging(&self, path: &Path) -> Result<Response> {
         let credential = self.config.get_session_credential().await?;
         let url = format!("{}?tagging", self.config.path_url(path));
         let response = self
@@ -645,6 +775,7 @@ impl GetClient for S3Client {
         etag_required: false,
         last_modified_required: false,
         version_header: Some(VERSION_HEADER),
+        user_defined_metadata_prefix: Some(USER_DEFINED_METADATA_HEADER_PREFIX),
     };
 
     /// Make an S3 GET request <https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html>
@@ -657,6 +788,14 @@ impl GetClient for S3Client {
         };
 
         let mut builder = self.client.request(method, url);
+        if self
+            .config
+            .encryption_headers
+            .0
+            .contains_key("x-amz-server-side-encryption-customer-algorithm")
+        {
+            builder = builder.headers(self.config.encryption_headers.clone().into());
+        }
 
         if let Some(v) = &options.version {
             builder = builder.query(&[("versionId", v)])

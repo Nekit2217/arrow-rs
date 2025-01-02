@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Integration tests for the Flight server.
+
+use core::str;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -42,11 +45,16 @@ type TonicStream<T> = Pin<Box<dyn Stream<Item = T> + Send + Sync + 'static>>;
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T = (), E = Error> = std::result::Result<T, E>;
 
+/// Run a scenario that tests integration testing.
 pub async fn scenario_setup(port: u16) -> Result {
     let addr = super::listen_on(port).await?;
+    let resolved_port = addr.port();
 
     let service = FlightServiceImpl {
-        server_location: format!("grpc+tcp://{addr}"),
+        // See https://github.com/apache/arrow-rs/issues/6577
+        // C# had trouble resolving addressed like 0.0.0.0:port
+        // server_location: format!("grpc+tcp://{addr}"),
+        server_location: format!("grpc+tcp://localhost:{resolved_port}"),
         ..Default::default()
     };
     let svc = FlightServiceServer::new(service);
@@ -65,6 +73,7 @@ struct IntegrationDataset {
     chunks: Vec<RecordBatch>,
 }
 
+/// Flight service implementation for integration testing
 #[derive(Clone, Default)]
 pub struct FlightServiceImpl {
     server_location: String,
@@ -100,13 +109,13 @@ impl FlightService for FlightServiceImpl {
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = request.into_inner();
 
-        let key = String::from_utf8(ticket.ticket.to_vec())
+        let key = str::from_utf8(&ticket.ticket)
             .map_err(|e| Status::invalid_argument(format!("Invalid ticket: {e:?}")))?;
 
         let uploaded_chunks = self.uploaded_chunks.lock().await;
 
         let flight = uploaded_chunks
-            .get(&key)
+            .get(key)
             .ok_or_else(|| Status::not_found(format!("Could not find flight. {key}")))?;
 
         let options = arrow::ipc::writer::IpcWriteOptions::default();
@@ -364,7 +373,7 @@ async fn save_uploaded_chunks(
 
                 let batch = record_batch_from_message(
                     message,
-                    &Buffer::from(data.data_body),
+                    &Buffer::from(data.data_body.as_ref()),
                     schema_ref.clone(),
                     &dictionaries_by_id,
                 )
@@ -375,7 +384,7 @@ async fn save_uploaded_chunks(
             ipc::MessageHeader::DictionaryBatch => {
                 dictionary_from_message(
                     message,
-                    &Buffer::from(data.data_body),
+                    &Buffer::from(data.data_body.as_ref()),
                     schema_ref.clone(),
                     &mut dictionaries_by_id,
                 )

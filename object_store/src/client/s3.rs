@@ -88,13 +88,21 @@ impl TryFrom<ListContents> for ObjectMeta {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct InitiateMultipartUploadResult {
+pub(crate) struct InitiateMultipartUploadResult {
     pub upload_id: String,
+}
+
+#[cfg(feature = "aws")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) struct CopyPartResult {
+    #[serde(rename = "ETag")]
+    pub e_tag: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct CompleteMultipartUpload {
+pub(crate) struct CompleteMultipartUpload {
     pub part: Vec<MultipartPart>,
 }
 
@@ -113,7 +121,7 @@ impl From<Vec<PartId>> for CompleteMultipartUpload {
 }
 
 #[derive(Debug, Serialize)]
-pub struct MultipartPart {
+pub(crate) struct MultipartPart {
     #[serde(rename = "ETag")]
     pub e_tag: String,
     #[serde(rename = "PartNumber")]
@@ -122,7 +130,7 @@ pub struct MultipartPart {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct CompleteMultipartUploadResult {
+pub(crate) struct CompleteMultipartUploadResult {
     #[serde(rename = "ETag")]
     pub e_tag: String,
 }

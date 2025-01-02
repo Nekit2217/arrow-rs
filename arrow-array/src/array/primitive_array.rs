@@ -239,13 +239,13 @@ pub type Float32Array = PrimitiveArray<Float32Type>;
 /// Construction
 ///
 /// ```
-/// # use arrow_array::Float32Array;
+/// # use arrow_array::Float64Array;
 /// // Create from Vec<Option<f32>>
-/// let arr = Float32Array::from(vec![Some(1.0), None, Some(2.0)]);
+/// let arr = Float64Array::from(vec![Some(1.0), None, Some(2.0)]);
 /// // Create from Vec<f32>
-/// let arr = Float32Array::from(vec![1.0, 2.0, 3.0]);
+/// let arr = Float64Array::from(vec![1.0, 2.0, 3.0]);
 /// // Create iter/collect
-/// let arr: Float32Array = std::iter::repeat(42.0).take(10).collect();
+/// let arr: Float64Array = std::iter::repeat(42.0).take(10).collect();
 /// ```
 ///
 /// See [`PrimitiveArray`] for more information and examples
@@ -713,6 +713,20 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
         }
     }
 
+    /// Creates a PrimitiveArray based on an iterator of values with provided nulls
+    pub fn from_iter_values_with_nulls<I: IntoIterator<Item = T::Native>>(
+        iter: I,
+        nulls: Option<NullBuffer>,
+    ) -> Self {
+        let val_buf: Buffer = iter.into_iter().collect();
+        let len = val_buf.len() / std::mem::size_of::<T::Native>();
+        Self {
+            data_type: T::DATA_TYPE,
+            values: ScalarBuffer::new(val_buf, 0, len),
+            nulls,
+        }
+    }
+
     /// Creates a PrimitiveArray based on a constant value with `count` elements
     pub fn from_value(value: T::Native, count: usize) -> Self {
         unsafe {
@@ -866,7 +880,6 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
     /// let c = a.unary_mut(|x| x * 2 + 1).unwrap();
     /// assert_eq!(c, Int32Array::from(vec![Some(11), Some(15), None]));
     /// ```
-
     pub fn unary_mut<F>(self, op: F) -> Result<PrimitiveArray<T>, PrimitiveArray<T>>
     where
         F: Fn(T::Native) -> T::Native,
@@ -1002,6 +1015,36 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
         PrimitiveArray::new(values, Some(nulls))
     }
 
+    /// Applies a unary infallible function to each value in an array, producing a
+    /// new primitive array.
+    ///
+    /// # Null Handling
+    ///
+    /// See [`Self::unary`] for more information on null handling.
+    ///
+    /// # Example: create an [`Int16Array`] from an [`ArrayAccessor`] with item type `&[u8]`
+    /// ```
+    /// use arrow_array::{Array, FixedSizeBinaryArray, Int16Array};
+    /// let input_arg = vec![ vec![1, 0], vec![2, 0], vec![3, 0] ];
+    /// let arr = FixedSizeBinaryArray::try_from_iter(input_arg.into_iter()).unwrap();
+    /// let c = Int16Array::from_unary(&arr, |x| i16::from_le_bytes(x[..2].try_into().unwrap()));
+    /// assert_eq!(c, Int16Array::from(vec![Some(1i16), Some(2i16), Some(3i16)]));
+    /// ```
+    pub fn from_unary<U: ArrayAccessor, F>(left: U, mut op: F) -> Self
+    where
+        F: FnMut(U::Item) -> T::Native,
+    {
+        let nulls = left.logical_nulls();
+        let buffer = unsafe {
+            // SAFETY: i in range 0..left.len()
+            let iter = (0..left.len()).map(|i| op(left.value_unchecked(i)));
+            // SAFETY: upper bound is trusted because `iter` is over a range
+            Buffer::from_trusted_len_iter(iter)
+        };
+
+        PrimitiveArray::new(buffer.into(), nulls)
+    }
+
     /// Returns a `PrimitiveBuilder` for this array, suitable for mutating values
     /// in place.
     ///
@@ -1117,6 +1160,10 @@ impl<T: ArrowPrimitiveType> Array for PrimitiveArray<T> {
         self.nulls.as_ref()
     }
 
+    fn logical_null_count(&self) -> usize {
+        self.null_count()
+    }
+
     fn get_buffer_memory_size(&self) -> usize {
         let mut size = self.values.inner().capacity();
         if let Some(n) = self.nulls.as_ref() {
@@ -1130,7 +1177,7 @@ impl<T: ArrowPrimitiveType> Array for PrimitiveArray<T> {
     }
 }
 
-impl<'a, T: ArrowPrimitiveType> ArrayAccessor for &'a PrimitiveArray<T> {
+impl<T: ArrowPrimitiveType> ArrayAccessor for &PrimitiveArray<T> {
     type Item = T::Native;
 
     fn value(&self, index: usize) -> Self::Item {
@@ -1526,9 +1573,7 @@ impl<T: DecimalType + ArrowPrimitiveType> PrimitiveArray<T> {
     /// Validates the Decimal Array, if the value of slot is overflow for the specified precision, and
     /// will be casted to Null
     pub fn null_if_overflow_precision(&self, precision: u8) -> Self {
-        self.unary_opt::<_, T>(|v| {
-            (T::validate_decimal_precision(v, precision).is_ok()).then_some(v)
-        })
+        self.unary_opt::<_, T>(|v| T::is_valid_decimal_precision(v, precision).then_some(v))
     }
 
     /// Returns [`Self::value`] formatted as a string

@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::array::print_long_array;
 use crate::{make_array, new_null_array, Array, ArrayRef, RecordBatch};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder};
-use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, SchemaBuilder};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields};
 use std::sync::Arc;
 use std::{any::Any, ops::Index};
 
@@ -326,7 +327,7 @@ impl TryFrom<Vec<(&str, ArrayRef)>> for StructArray {
 
     /// builds a StructArray from a vector of names and arrays.
     fn try_from(values: Vec<(&str, ArrayRef)>) -> Result<Self, ArrowError> {
-        let (schema, arrays): (SchemaBuilder, _) = values
+        let (fields, arrays): (Vec<_>, _) = values
             .into_iter()
             .map(|(name, array)| {
                 (
@@ -336,7 +337,7 @@ impl TryFrom<Vec<(&str, ArrayRef)>> for StructArray {
             })
             .unzip();
 
-        StructArray::try_new(schema.finish().fields, arrays, None)
+        StructArray::try_new(fields.into(), arrays, None)
     }
 }
 
@@ -377,6 +378,11 @@ impl Array for StructArray {
         self.nulls.as_ref()
     }
 
+    fn logical_null_count(&self) -> usize {
+        // More efficient that the default implementation
+        self.null_count()
+    }
+
     fn get_buffer_memory_size(&self) -> usize {
         let mut size = self.fields.iter().map(|a| a.get_buffer_memory_size()).sum();
         if let Some(n) = self.nulls.as_ref() {
@@ -397,14 +403,18 @@ impl Array for StructArray {
 
 impl From<Vec<(FieldRef, ArrayRef)>> for StructArray {
     fn from(v: Vec<(FieldRef, ArrayRef)>) -> Self {
-        let (schema, arrays): (SchemaBuilder, _) = v.into_iter().unzip();
-        StructArray::new(schema.finish().fields, arrays, None)
+        let (fields, arrays): (Vec<_>, _) = v.into_iter().unzip();
+        StructArray::new(fields.into(), arrays, None)
     }
 }
 
 impl std::fmt::Debug for StructArray {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "StructArray\n[\n")?;
+        writeln!(f, "StructArray")?;
+        writeln!(f, "-- validity: ")?;
+        writeln!(f, "[")?;
+        print_long_array(self, f, |_array, _index, f| write!(f, "valid"))?;
+        writeln!(f, "]\n[")?;
         for (child_index, name) in self.column_names().iter().enumerate() {
             let column = self.column(child_index);
             writeln!(
@@ -424,9 +434,9 @@ impl std::fmt::Debug for StructArray {
 impl From<(Vec<(FieldRef, ArrayRef)>, Buffer)> for StructArray {
     fn from(pair: (Vec<(FieldRef, ArrayRef)>, Buffer)) -> Self {
         let len = pair.0.first().map(|x| x.1.len()).unwrap_or_default();
-        let (fields, arrays): (SchemaBuilder, Vec<_>) = pair.0.into_iter().unzip();
+        let (fields, arrays): (Vec<_>, Vec<_>) = pair.0.into_iter().unzip();
         let nulls = NullBuffer::new(BooleanBuffer::new(pair.1, 0, len));
-        Self::new(fields.finish().fields, arrays, Some(nulls))
+        Self::new(fields.into(), arrays, Some(nulls))
     }
 }
 
@@ -549,7 +559,7 @@ mod tests {
         let expected_string_data = ArrayData::builder(DataType::Utf8)
             .len(4)
             .null_bit_buffer(Some(Buffer::from(&[9_u8])))
-            .add_buffer(Buffer::from(&[0, 3, 3, 3, 7].to_byte_slice()))
+            .add_buffer(Buffer::from([0, 3, 3, 3, 7].to_byte_slice()))
             .add_buffer(Buffer::from(b"joemark"))
             .build()
             .unwrap();
@@ -557,7 +567,7 @@ mod tests {
         let expected_int_data = ArrayData::builder(DataType::Int32)
             .len(4)
             .null_bit_buffer(Some(Buffer::from(&[11_u8])))
-            .add_buffer(Buffer::from(&[1, 2, 0, 4].to_byte_slice()))
+            .add_buffer(Buffer::from([1, 2, 0, 4].to_byte_slice()))
             .build()
             .unwrap();
 
@@ -730,5 +740,17 @@ mod tests {
             Arc::new(Field::new("c", DataType::Int32, false)),
             Arc::new(Int32Array::from(vec![Some(42), None, Some(19)])) as ArrayRef,
         )]));
+    }
+
+    #[test]
+    fn test_struct_array_fmt_debug() {
+        let arr: StructArray = StructArray::new(
+            vec![Arc::new(Field::new("c", DataType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from((0..30).collect::<Vec<_>>())) as ArrayRef],
+            Some(NullBuffer::new(BooleanBuffer::from(
+                (0..30).map(|i| i % 2 == 0).collect::<Vec<_>>(),
+            ))),
+        );
+        assert_eq!(format!("{arr:?}"), "StructArray\n-- validity: \n[\n  valid,\n  null,\n  valid,\n  null,\n  valid,\n  null,\n  valid,\n  null,\n  valid,\n  null,\n  ...10 elements...,\n  valid,\n  null,\n  valid,\n  null,\n  valid,\n  null,\n  valid,\n  null,\n  valid,\n  null,\n]\n[\n-- child 0: \"c\" (Int32)\nPrimitiveArray<Int32>\n[\n  0,\n  1,\n  2,\n  3,\n  4,\n  5,\n  6,\n  7,\n  8,\n  9,\n  ...10 elements...,\n  20,\n  21,\n  22,\n  23,\n  24,\n  25,\n  26,\n  27,\n  28,\n  29,\n]\n]")
     }
 }

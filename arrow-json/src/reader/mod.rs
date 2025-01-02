@@ -289,7 +289,7 @@ impl ReaderBuilder {
 
         let decoder = make_decoder(data_type, self.coerce_primitive, self.strict_mode, nullable)?;
 
-        let num_fields = self.schema.all_fields().len();
+        let num_fields = self.schema.flattened_fields().len();
 
         Ok(Decoder {
             decoder,
@@ -691,6 +691,10 @@ fn make_decoder(
         DataType::Time32(TimeUnit::Millisecond) => primitive_decoder!(Time32MillisecondType, data_type),
         DataType::Time64(TimeUnit::Microsecond) => primitive_decoder!(Time64MicrosecondType, data_type),
         DataType::Time64(TimeUnit::Nanosecond) => primitive_decoder!(Time64NanosecondType, data_type),
+        DataType::Duration(TimeUnit::Nanosecond) => primitive_decoder!(DurationNanosecondType, data_type),
+        DataType::Duration(TimeUnit::Microsecond) => primitive_decoder!(DurationMicrosecondType, data_type),
+        DataType::Duration(TimeUnit::Millisecond) => primitive_decoder!(DurationMillisecondType, data_type),
+        DataType::Duration(TimeUnit::Second) => primitive_decoder!(DurationSecondType, data_type),
         DataType::Decimal128(p, s) => Ok(Box::new(DecimalArrayDecoder::<Decimal128Type>::new(p, s))),
         DataType::Decimal256(p, s) => Ok(Box::new(DecimalArrayDecoder::<Decimal256Type>::new(p, s))),
         DataType::Boolean => Ok(Box::<BooleanArrayDecoder>::default()),
@@ -1007,7 +1011,7 @@ mod tests {
         let map_values = map.values().as_list::<i32>();
         assert_eq!(map.value_offsets(), &[0, 1, 3, 5]);
 
-        let k: Vec<_> = map_keys.iter().map(|x| x.unwrap()).collect();
+        let k: Vec<_> = map_keys.iter().flatten().collect();
         assert_eq!(&k, &["a", "a", "b", "c", "a"]);
 
         let list_values = map_values.values().as_string::<i32>();
@@ -1328,6 +1332,37 @@ mod tests {
         test_time::<Time32SecondType>();
         test_time::<Time64MicrosecondType>();
         test_time::<Time64NanosecondType>();
+    }
+
+    fn test_duration<T: ArrowTemporalType>() {
+        let buf = r#"
+        {"a": 1, "b": "2"}
+        {"a": 3, "b": null}
+        "#;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", T::DATA_TYPE, true),
+            Field::new("b", T::DATA_TYPE, true),
+        ]));
+
+        let batches = do_read(buf, 1024, true, false, schema);
+        assert_eq!(batches.len(), 1);
+
+        let col_a = batches[0].column_by_name("a").unwrap().as_primitive::<T>();
+        assert_eq!(col_a.null_count(), 0);
+        assert_eq!(col_a.values(), &[1, 3].map(T::Native::usize_as));
+
+        let col2 = batches[0].column_by_name("b").unwrap().as_primitive::<T>();
+        assert_eq!(col2.null_count(), 1);
+        assert_eq!(col2.values(), &[2, 0].map(T::Native::usize_as));
+    }
+
+    #[test]
+    fn test_durations() {
+        test_duration::<DurationNanosecondType>();
+        test_duration::<DurationMicrosecondType>();
+        test_duration::<DurationMillisecondType>();
+        test_duration::<DurationSecondType>();
     }
 
     #[test]
@@ -1850,7 +1885,7 @@ mod tests {
         let c = ArrayDataBuilder::new(c_field.data_type().clone())
             .len(7)
             .add_child_data(d.to_data())
-            .null_bit_buffer(Some(Buffer::from(vec![0b00111011])))
+            .null_bit_buffer(Some(Buffer::from([0b00111011])))
             .build()
             .unwrap();
         let b = BooleanArray::from(vec![
@@ -1866,14 +1901,14 @@ mod tests {
             .len(7)
             .add_child_data(b.to_data())
             .add_child_data(c.clone())
-            .null_bit_buffer(Some(Buffer::from(vec![0b00111111])))
+            .null_bit_buffer(Some(Buffer::from([0b00111111])))
             .build()
             .unwrap();
         let a_list = ArrayDataBuilder::new(a_field.data_type().clone())
             .len(6)
             .add_buffer(Buffer::from_slice_ref([0i32, 2, 3, 6, 6, 6, 7]))
             .add_child_data(a)
-            .null_bit_buffer(Some(Buffer::from(vec![0b00110111])))
+            .null_bit_buffer(Some(Buffer::from([0b00110111])))
             .build()
             .unwrap();
         let expected = make_array(a_list);

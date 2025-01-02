@@ -36,7 +36,7 @@ use reqwest::{Method, StatusCode};
 use std::{sync::Arc, time::Duration};
 use url::Url;
 
-use crate::aws::client::{RequestError, S3Client};
+use crate::aws::client::{CompleteMultipartMode, PutPartPayload, RequestError, S3Client};
 use crate::client::get::GetClientExt;
 use crate::client::list::ListClientExt;
 use crate::client::CredentialProvider;
@@ -60,7 +60,7 @@ mod dynamo;
 mod precondition;
 mod resolve;
 
-pub use builder::{AmazonS3Builder, AmazonS3ConfigKey, S3EncryptionHeaders};
+pub use builder::{AmazonS3Builder, AmazonS3ConfigKey};
 pub use checksum::Checksum;
 pub use dynamo::DynamoCommit;
 pub use precondition::{S3ConditionalPut, S3CopyIfNotExists};
@@ -77,7 +77,7 @@ use crate::client::parts::Parts;
 pub use credential::{AwsAuthorizer, AwsCredential};
 
 /// Interface for [Amazon S3](https://aws.amazon.com/s3/).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AmazonS3 {
     client: Arc<S3Client>,
 }
@@ -169,7 +169,10 @@ impl ObjectStore for AmazonS3 {
         match (opts.mode, &self.client.config.conditional_put) {
             (PutMode::Overwrite, _) => request.idempotent(true).do_put().await,
             (PutMode::Create | PutMode::Update(_), None) => Err(Error::NotImplemented),
-            (PutMode::Create, Some(S3ConditionalPut::ETagMatch)) => {
+            (
+                PutMode::Create,
+                Some(S3ConditionalPut::ETagMatch | S3ConditionalPut::ETagPutIfNotExists),
+            ) => {
                 match request.header(&IF_NONE_MATCH, "*").do_put().await {
                     // Technically If-None-Match should return NotModified but some stores,
                     // such as R2, instead return PreconditionFailed
@@ -193,6 +196,7 @@ impl ObjectStore for AmazonS3 {
                     source: "ETag required for conditional put".to_string().into(),
                 })?;
                 match put {
+                    S3ConditionalPut::ETagPutIfNotExists => Err(Error::NotImplemented),
                     S3ConditionalPut::ETagMatch => {
                         request.header(&IF_MATCH, etag.as_str()).do_put().await
                     }
@@ -293,6 +297,47 @@ impl ObjectStore for AmazonS3 {
         let (k, v, status) = match &self.client.config.copy_if_not_exists {
             Some(S3CopyIfNotExists::Header(k, v)) => (k, v, StatusCode::PRECONDITION_FAILED),
             Some(S3CopyIfNotExists::HeaderWithStatus(k, v, status)) => (k, v, *status),
+            Some(S3CopyIfNotExists::Multipart) => {
+                let upload_id = self
+                    .client
+                    .create_multipart(to, PutMultipartOpts::default())
+                    .await?;
+
+                let res = async {
+                    let part_id = self
+                        .client
+                        .put_part(to, &upload_id, 0, PutPartPayload::Copy(from))
+                        .await?;
+                    match self
+                        .client
+                        .complete_multipart(
+                            to,
+                            &upload_id,
+                            vec![part_id],
+                            CompleteMultipartMode::Create,
+                        )
+                        .await
+                    {
+                        Err(e @ Error::Precondition { .. }) => Err(Error::AlreadyExists {
+                            path: to.to_string(),
+                            source: Box::new(e),
+                        }),
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(e),
+                    }
+                }
+                .await;
+
+                // If the multipart upload failed, make a best effort attempt to
+                // clean it up. It's the caller's responsibility to add a
+                // lifecycle rule if guaranteed cleanup is required, as we
+                // cannot protect against an ill-timed process crash.
+                if res.is_err() {
+                    let _ = self.client.abort_multipart(to, &upload_id).await;
+                }
+
+                return res;
+            }
             Some(S3CopyIfNotExists::Dynamo(lock)) => {
                 return lock.copy_if_not_exists(&self.client, from, to).await
             }
@@ -340,7 +385,12 @@ impl MultipartUpload for S3MultiPartUpload {
         Box::pin(async move {
             let part = state
                 .client
-                .put_part(&state.location, &state.upload_id, idx, data)
+                .put_part(
+                    &state.location,
+                    &state.upload_id,
+                    idx,
+                    PutPartPayload::Part(data),
+                )
                 .await?;
             state.parts.put(idx, part);
             Ok(())
@@ -352,7 +402,12 @@ impl MultipartUpload for S3MultiPartUpload {
 
         self.state
             .client
-            .complete_multipart(&self.state.location, &self.state.upload_id, parts)
+            .complete_multipart(
+                &self.state.location,
+                &self.state.upload_id,
+                parts,
+                CompleteMultipartMode::Overwrite,
+            )
             .await
     }
 
@@ -384,7 +439,9 @@ impl MultipartStore for AmazonS3 {
         part_idx: usize,
         data: PutPayload,
     ) -> Result<PartId> {
-        self.client.put_part(path, id, part_idx, data).await
+        self.client
+            .put_part(path, id, part_idx, PutPartPayload::Part(data))
+            .await
     }
 
     async fn complete_multipart(
@@ -393,7 +450,9 @@ impl MultipartStore for AmazonS3 {
         id: &MultipartId,
         parts: Vec<PartId>,
     ) -> Result<PutResult> {
-        self.client.complete_multipart(path, id, parts).await
+        self.client
+            .complete_multipart(path, id, parts, CompleteMultipartMode::Overwrite)
+            .await
     }
 
     async fn abort_multipart(&self, path: &Path, id: &MultipartId) -> Result<()> {
@@ -412,6 +471,9 @@ mod tests {
     use crate::client::get::GetClient;
     use crate::integration::*;
     use crate::tests::*;
+    use crate::ClientOptions;
+    use base64::prelude::BASE64_STANDARD;
+    use base64::Engine;
     use hyper::HeaderMap;
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
@@ -424,7 +486,6 @@ mod tests {
         let integration = config.build().unwrap();
         let config = &integration.client.config;
         let test_not_exists = config.copy_if_not_exists.is_some();
-        let test_conditional_put = config.conditional_put.is_some();
 
         put_get_delete_list(&integration).await;
         get_opts(&integration).await;
@@ -455,8 +516,9 @@ mod tests {
         if test_not_exists {
             copy_if_not_exists(&integration).await;
         }
-        if test_conditional_put {
-            put_opts(&integration, true).await;
+        if let Some(conditional_put) = &config.conditional_put {
+            let supports_update = !matches!(conditional_put, S3ConditionalPut::ETagPutIfNotExists);
+            put_opts(&integration, supports_update).await;
         }
 
         // run integration test with unsigned payload enabled
@@ -600,6 +662,69 @@ mod tests {
                     .get("x-amz-server-side-encryption")
                     .expect("object is not encrypted"),
                 expected_encryption
+            );
+
+            store.delete(location).await.unwrap();
+        }
+    }
+
+    /// See CONTRIBUTING.md for the MinIO setup for this test.
+    #[tokio::test]
+    async fn test_s3_ssec_encryption_with_minio() {
+        if std::env::var("TEST_S3_SSEC_ENCRYPTION").is_err() {
+            eprintln!("Skipping S3 SSE-C encryption test");
+            return;
+        }
+        eprintln!("Running S3 SSE-C encryption test");
+
+        let customer_key = "1234567890abcdef1234567890abcdef";
+        let expected_md5 = "JMwgiexXqwuPqIPjYFmIZQ==";
+
+        let store = AmazonS3Builder::from_env()
+            .with_ssec_encryption(BASE64_STANDARD.encode(customer_key))
+            .with_client_options(ClientOptions::default().with_allow_invalid_certificates(true))
+            .build()
+            .unwrap();
+
+        let data = PutPayload::from(vec![3u8; 1024]);
+
+        let locations = [
+            Path::from("test-encryption-1"),
+            Path::from("test-encryption-2"),
+            Path::from("test-encryption-3"),
+        ];
+
+        // Test put with sse-c.
+        store.put(&locations[0], data.clone()).await.unwrap();
+
+        // Test copy with sse-c.
+        store.copy(&locations[0], &locations[1]).await.unwrap();
+
+        // Test multipart upload with sse-c.
+        let mut upload = store.put_multipart(&locations[2]).await.unwrap();
+        upload.put_part(data.clone()).await.unwrap();
+        upload.complete().await.unwrap();
+
+        // Test get with sse-c.
+        for location in &locations {
+            let res = store
+                .client
+                .get_request(location, GetOptions::default())
+                .await
+                .unwrap();
+            let headers = res.headers();
+            assert_eq!(
+                headers
+                    .get("x-amz-server-side-encryption-customer-algorithm")
+                    .expect("object is not encrypted with SSE-C"),
+                "AES256"
+            );
+
+            assert_eq!(
+                headers
+                    .get("x-amz-server-side-encryption-customer-key-MD5")
+                    .expect("object is not encrypted with SSE-C"),
+                expected_md5
             );
 
             store.delete(location).await.unwrap();

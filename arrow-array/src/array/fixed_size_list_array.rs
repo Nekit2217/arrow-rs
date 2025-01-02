@@ -60,23 +60,23 @@ use std::sync::Arc;
 ///
 /// ```text
 ///                                 ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-///                                                         ┌ ─ ─ ─ ─ ─ ─ ─ ─┐    
+///                                                         ┌ ─ ─ ─ ─ ─ ─ ─ ─┐
 ///  ┌─────────────┐                │     ┌───┐               ┌───┐ ┌──────┐      │
-///  │   [A,B]     │                      │ 1 │             │ │ 1 │ │  A   │ │ 0  
+///  │   [A,B]     │                      │ 1 │             │ │ 1 │ │  A   │ │ 0
 ///  ├─────────────┤                │     ├───┤               ├───┤ ├──────┤      │
-///  │    NULL     │                      │ 0 │             │ │ 1 │ │  B   │ │ 1  
+///  │    NULL     │                      │ 0 │             │ │ 1 │ │  B   │ │ 1
 ///  ├─────────────┤                │     ├───┤               ├───┤ ├──────┤      │
-///  │  [C,NULL]   │                      │ 1 │             │ │ 0 │ │ ???? │ │ 2  
+///  │  [C,NULL]   │                      │ 1 │             │ │ 0 │ │ ???? │ │ 2
 ///  └─────────────┘                │     └───┘               ├───┤ ├──────┤      │
-///                                                         | │ 0 │ │ ???? │ │ 3  
+///                                                         | │ 0 │ │ ???? │ │ 3
 ///  Logical Values                 │   Validity              ├───┤ ├──────┤      │
-///                                     (nulls)             │ │ 1 │ │  C   │ │ 4  
+///                                     (nulls)             │ │ 1 │ │  C   │ │ 4
 ///                                 │                         ├───┤ ├──────┤      │
-///                                                         │ │ 0 │ │ ???? │ │ 5  
+///                                                         │ │ 0 │ │ ???? │ │ 5
 ///                                 │                         └───┘ └──────┘      │
-///                                                         │     Values     │    
+///                                                         │     Values     │
 ///                                 │   FixedSizeListArray        (Array)         │
-///                                                         └ ─ ─ ─ ─ ─ ─ ─ ─┘    
+///                                                         └ ─ ─ ─ ─ ─ ─ ─ ─┘
 ///                                 └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
 /// ```
 ///
@@ -409,6 +409,11 @@ impl Array for FixedSizeListArray {
         self.nulls.as_ref()
     }
 
+    fn logical_null_count(&self) -> usize {
+        // More efficient that the default implementation
+        self.null_count()
+    }
+
     fn get_buffer_memory_size(&self) -> usize {
         let mut size = self.values.get_buffer_memory_size();
         if let Some(n) = self.nulls.as_ref() {
@@ -448,7 +453,7 @@ impl std::fmt::Debug for FixedSizeListArray {
     }
 }
 
-impl<'a> ArrayAccessor for &'a FixedSizeListArray {
+impl ArrayAccessor for &FixedSizeListArray {
     type Item = ArrayRef;
 
     fn value(&self, index: usize) -> Self::Item {
@@ -674,7 +679,7 @@ mod tests {
         assert_eq!(err.to_string(), "Invalid argument error: Found unmasked nulls for non-nullable FixedSizeListArray field \"item\"");
 
         // Valid as nulls in child masked by parent
-        let nulls = NullBuffer::new(BooleanBuffer::new(vec![0b0000101].into(), 0, 3));
+        let nulls = NullBuffer::new(BooleanBuffer::new(Buffer::from([0b0000101]), 0, 3));
         FixedSizeListArray::new(field, 2, values.clone(), Some(nulls));
 
         let field = Arc::new(Field::new("item", DataType::Int64, true));

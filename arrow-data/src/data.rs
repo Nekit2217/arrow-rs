@@ -161,9 +161,11 @@ pub(crate) fn new_buffers(data_type: &DataType, capacity: usize) -> [MutableBuff
     }
 }
 
-/// A generic representation of Arrow array data which encapsulates common attributes and
-/// operations for Arrow array. Specific operations for different arrays types (e.g.,
-/// primitive, list, struct) are implemented in `Array`.
+/// A generic representation of Arrow array data which encapsulates common attributes
+/// and operations for Arrow array.
+///
+/// Specific operations for different arrays types (e.g., primitive, list, struct)
+/// are implemented in `Array`.
 ///
 /// # Memory Layout
 ///
@@ -229,6 +231,7 @@ pub struct ArrayData {
     nulls: Option<NullBuffer>,
 }
 
+/// A thread-safe, shared reference to the Arrow array data.
 pub type ArrayDataRef = Arc<ArrayData>;
 
 impl ArrayData {
@@ -690,14 +693,20 @@ impl ArrayData {
     ///
     /// This can be useful for when interacting with data sent over IPC or FFI, that may
     /// not meet the minimum alignment requirements
+    ///
+    /// This also aligns buffers of children data
     pub fn align_buffers(&mut self) {
         let layout = layout(&self.data_type);
         for (buffer, spec) in self.buffers.iter_mut().zip(&layout.buffers) {
             if let BufferSpec::FixedWidth { alignment, .. } = spec {
                 if buffer.as_ptr().align_offset(*alignment) != 0 {
-                    *buffer = Buffer::from_slice_ref(buffer.as_ref())
+                    *buffer = Buffer::from_slice_ref(buffer.as_ref());
                 }
             }
+        }
+        // align children data recursively
+        for data in self.child_data.iter_mut() {
+            data.align_buffers()
         }
     }
 
@@ -1179,8 +1188,10 @@ impl ArrayData {
     ///
     /// Does not (yet) check
     /// 1. Union type_ids are valid see [#85](https://github.com/apache/arrow-rs/issues/85)
-    /// Validates the the null count is correct and that any
-    /// nullability requirements of its children are correct
+    /// 2. the the null count is correct and that any
+    /// 3. nullability requirements of its children are correct
+    ///
+    /// [#85]: https://github.com/apache/arrow-rs/issues/85
     pub fn validate_nulls(&self) -> Result<(), ArrowError> {
         if let Some(nulls) = &self.nulls {
             let actual = nulls.len() - nulls.inner().count_set_bits();
@@ -1743,7 +1754,12 @@ pub enum BufferSpec {
     /// for array slicing and interoperability with `Vec`, which cannot be over-aligned.
     ///
     /// Note that these alignment requirements will vary between architectures
-    FixedWidth { byte_width: usize, alignment: usize },
+    FixedWidth {
+        /// The width of each element in bytes
+        byte_width: usize,
+        /// The alignment required by Rust for an array of the corresponding primitive
+        alignment: usize,
+    },
     /// Variable width, such as string data for utf8 data
     VariableWidth,
     /// Buffer holds a bitmap.
@@ -1779,6 +1795,7 @@ pub struct ArrayDataBuilder {
 
 impl ArrayDataBuilder {
     #[inline]
+    /// Creates a new array data builder
     pub const fn new(data_type: DataType) -> Self {
         Self {
             data_type,
@@ -1792,17 +1809,20 @@ impl ArrayDataBuilder {
         }
     }
 
+    /// Creates a new array data builder from an existing one, changing the data type
     pub fn data_type(self, data_type: DataType) -> Self {
         Self { data_type, ..self }
     }
 
     #[inline]
     #[allow(clippy::len_without_is_empty)]
+    /// Sets the length of the [ArrayData]
     pub const fn len(mut self, n: usize) -> Self {
         self.len = n;
         self
     }
 
+    /// Sets the null buffer of the [ArrayData]
     pub fn nulls(mut self, nulls: Option<NullBuffer>) -> Self {
         self.nulls = nulls;
         self.null_count = None;
@@ -1810,43 +1830,51 @@ impl ArrayDataBuilder {
         self
     }
 
+    /// Sets the null count of the [ArrayData]
     pub fn null_count(mut self, null_count: usize) -> Self {
         self.null_count = Some(null_count);
         self
     }
 
+    /// Sets the `null_bit_buffer` of the [ArrayData]
     pub fn null_bit_buffer(mut self, buf: Option<Buffer>) -> Self {
         self.nulls = None;
         self.null_bit_buffer = buf;
         self
     }
 
+    /// Sets the offset of the [ArrayData]
     #[inline]
     pub const fn offset(mut self, n: usize) -> Self {
         self.offset = n;
         self
     }
 
+    /// Sets the buffers of the [ArrayData]
     pub fn buffers(mut self, v: Vec<Buffer>) -> Self {
         self.buffers = v;
         self
     }
 
+    /// Adds a single buffer to the [ArrayData]'s buffers
     pub fn add_buffer(mut self, b: Buffer) -> Self {
         self.buffers.push(b);
         self
     }
 
-    pub fn add_buffers(mut self, bs: Vec<Buffer>) -> Self {
+    /// Adds multiple buffers to the [ArrayData]'s buffers
+    pub fn add_buffers<I: IntoIterator<Item = Buffer>>(mut self, bs: I) -> Self {
         self.buffers.extend(bs);
         self
     }
 
+    /// Sets the child data of the [ArrayData]
     pub fn child_data(mut self, v: Vec<ArrayData>) -> Self {
         self.child_data = v;
         self
     }
 
+    /// Adds a single child data to the [ArrayData]'s child data
     pub fn add_child_data(mut self, r: ArrayData) -> Self {
         self.child_data.push(r);
         self
@@ -1869,14 +1897,17 @@ impl ArrayDataBuilder {
 
     /// Same as [`Self::build_unchecked`] but ignoring `force_validate` feature flag
     unsafe fn build_impl(self) -> ArrayData {
-        let nulls = self.nulls.or_else(|| {
-            let buffer = self.null_bit_buffer?;
-            let buffer = BooleanBuffer::new(buffer, self.offset, self.len);
-            Some(match self.null_count {
-                Some(n) => NullBuffer::new_unchecked(buffer, n),
-                None => NullBuffer::new(buffer),
+        let nulls = self
+            .nulls
+            .or_else(|| {
+                let buffer = self.null_bit_buffer?;
+                let buffer = BooleanBuffer::new(buffer, self.offset, self.len);
+                Some(match self.null_count {
+                    Some(n) => NullBuffer::new_unchecked(buffer, n),
+                    None => NullBuffer::new(buffer),
+                })
             })
-        });
+            .filter(|b| b.null_count() != 0);
 
         ArrayData {
             data_type: self.data_type,
@@ -1884,7 +1915,7 @@ impl ArrayDataBuilder {
             offset: self.offset,
             buffers: self.buffers,
             child_data: self.child_data,
-            nulls: nulls.filter(|b| b.null_count() != 0),
+            nulls,
         }
     }
 
@@ -1936,7 +1967,7 @@ impl From<ArrayData> for ArrayDataBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::Field;
+    use arrow_schema::{Field, Fields};
 
     // See arrow/tests/array_data_validation.rs for test of array validation
 
@@ -1959,7 +1990,7 @@ mod tests {
             .len(20)
             .offset(5)
             .add_buffer(b1)
-            .null_bit_buffer(Some(Buffer::from(vec![
+            .null_bit_buffer(Some(Buffer::from([
                 0b01011111, 0b10110101, 0b01100011, 0b00011110,
             ])))
             .build()
@@ -2164,7 +2195,7 @@ mod tests {
 
     #[test]
     fn test_count_nulls() {
-        let buffer = Buffer::from(vec![0b00010110, 0b10011111]);
+        let buffer = Buffer::from([0b00010110, 0b10011111]);
         let buffer = NullBuffer::new(BooleanBuffer::new(buffer, 0, 16));
         let count = count_nulls(Some(&buffer), 0, 16);
         assert_eq!(count, 7);
@@ -2199,7 +2230,46 @@ mod tests {
         };
         data.validate_full().unwrap();
 
+        // break alignment in data
         data.buffers[0] = sliced;
+        let err = data.validate().unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument error: Misaligned buffers[0] in array of type Int32, offset from expected alignment of 4 by 1"
+        );
+
+        data.align_buffers();
+        data.validate_full().unwrap();
+    }
+
+    #[test]
+    fn test_alignment_struct() {
+        let buffer = Buffer::from_vec(vec![1_i32, 2_i32, 3_i32]);
+        let sliced = buffer.slice(1);
+
+        let child_data = ArrayData {
+            data_type: DataType::Int32,
+            len: 0,
+            offset: 0,
+            buffers: vec![buffer],
+            child_data: vec![],
+            nulls: None,
+        };
+
+        let schema = DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, false)]));
+        let mut data = ArrayData {
+            data_type: schema,
+            len: 0,
+            offset: 0,
+            buffers: vec![],
+            child_data: vec![child_data],
+            nulls: None,
+        };
+        data.validate_full().unwrap();
+
+        // break alignment in child data
+        data.child_data[0].buffers[0] = sliced;
         let err = data.validate().unwrap_err();
 
         assert_eq!(

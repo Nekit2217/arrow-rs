@@ -250,7 +250,7 @@ where
         }
     };
 
-    let integers = first_part.trim_start_matches('0');
+    let integers = first_part;
     let decimals = if parts.len() == 2 { parts[1] } else { "" };
 
     if !integers.is_empty() && !integers.as_bytes()[0].is_ascii_digit() {
@@ -323,8 +323,8 @@ where
     })
 }
 
-pub(crate) fn string_to_decimal_cast<T, Offset: OffsetSizeTrait>(
-    from: &GenericStringArray<Offset>,
+pub(crate) fn generic_string_to_decimal_cast<'a, T, S>(
+    from: &'a S,
     precision: u8,
     scale: i8,
     cast_options: &CastOptions,
@@ -332,15 +332,12 @@ pub(crate) fn string_to_decimal_cast<T, Offset: OffsetSizeTrait>(
 where
     T: DecimalType,
     T::Native: DecimalCast + ArrowNativeTypeOp,
+    &'a S: StringArrayType<'a>,
 {
     if cast_options.safe {
         let iter = from.iter().map(|v| {
             v.and_then(|v| parse_string_to_decimal_native::<T>(v, scale as usize).ok())
-                .and_then(|v| {
-                    T::validate_decimal_precision(v, precision)
-                        .is_ok()
-                        .then_some(v)
-                })
+                .and_then(|v| T::is_valid_decimal_precision(v, precision).then_some(v))
         });
         // Benefit:
         //     20% performance improvement
@@ -379,6 +376,37 @@ where
     }
 }
 
+pub(crate) fn string_to_decimal_cast<T, Offset: OffsetSizeTrait>(
+    from: &GenericStringArray<Offset>,
+    precision: u8,
+    scale: i8,
+    cast_options: &CastOptions,
+) -> Result<PrimitiveArray<T>, ArrowError>
+where
+    T: DecimalType,
+    T::Native: DecimalCast + ArrowNativeTypeOp,
+{
+    generic_string_to_decimal_cast::<T, GenericStringArray<Offset>>(
+        from,
+        precision,
+        scale,
+        cast_options,
+    )
+}
+
+pub(crate) fn string_view_to_decimal_cast<T>(
+    from: &StringViewArray,
+    precision: u8,
+    scale: i8,
+    cast_options: &CastOptions,
+) -> Result<PrimitiveArray<T>, ArrowError>
+where
+    T: DecimalType,
+    T::Native: DecimalCast + ArrowNativeTypeOp,
+{
+    generic_string_to_decimal_cast::<T, StringViewArray>(from, precision, scale, cast_options)
+}
+
 /// Cast Utf8 to decimal
 pub(crate) fn cast_string_to_decimal<T, Offset: OffsetSizeTrait>(
     from: &dyn Array,
@@ -403,14 +431,30 @@ where
         )));
     }
 
-    Ok(Arc::new(string_to_decimal_cast::<T, Offset>(
-        from.as_any()
-            .downcast_ref::<GenericStringArray<Offset>>()
-            .unwrap(),
-        precision,
-        scale,
-        cast_options,
-    )?))
+    let result = match from.data_type() {
+        DataType::Utf8View => string_view_to_decimal_cast::<T>(
+            from.as_any().downcast_ref::<StringViewArray>().unwrap(),
+            precision,
+            scale,
+            cast_options,
+        )?,
+        DataType::Utf8 | DataType::LargeUtf8 => string_to_decimal_cast::<T, Offset>(
+            from.as_any()
+                .downcast_ref::<GenericStringArray<Offset>>()
+                .unwrap(),
+            precision,
+            scale,
+            cast_options,
+        )?,
+        other => {
+            return Err(ArrowError::ComputeError(format!(
+                "Cannot cast {:?} to decimal",
+                other
+            )))
+        }
+    };
+
+    Ok(Arc::new(result))
 }
 
 pub(crate) fn cast_floating_point_to_decimal128<T: ArrowPrimitiveType>(
@@ -430,7 +474,7 @@ where
                 (mul * v.as_())
                     .round()
                     .to_i128()
-                    .filter(|v| Decimal128Type::validate_decimal_precision(*v, precision).is_ok())
+                    .filter(|v| Decimal128Type::is_valid_decimal_precision(*v, precision))
             })
             .with_precision_and_scale(precision, scale)
             .map(|a| Arc::new(a) as ArrayRef)
@@ -473,7 +517,7 @@ where
         array
             .unary_opt::<_, Decimal256Type>(|v| {
                 i256::from_f64((v.as_() * mul).round())
-                    .filter(|v| Decimal256Type::validate_decimal_precision(*v, precision).is_ok())
+                    .filter(|v| Decimal256Type::is_valid_decimal_precision(*v, precision))
             })
             .with_precision_and_scale(precision, scale)
             .map(|a| Arc::new(a) as ArrayRef)
@@ -570,4 +614,49 @@ where
     let array = array.as_primitive::<D>();
     let array = array.unary::<_, T>(op);
     Ok(Arc::new(array))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_string_to_decimal_native() -> Result<(), ArrowError> {
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal128Type>("0", 0)?,
+            0_i128
+        );
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal128Type>("0", 5)?,
+            0_i128
+        );
+
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal128Type>("123", 0)?,
+            123_i128
+        );
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal128Type>("123", 5)?,
+            12300000_i128
+        );
+
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal128Type>("123.45", 0)?,
+            123_i128
+        );
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal128Type>("123.45", 5)?,
+            12345000_i128
+        );
+
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal128Type>("123.4567891", 0)?,
+            123_i128
+        );
+        assert_eq!(
+            parse_string_to_decimal_native::<Decimal128Type>("123.4567891", 5)?,
+            12345679_i128
+        );
+        Ok(())
+    }
 }

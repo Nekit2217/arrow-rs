@@ -134,7 +134,8 @@ impl Block {
 
     #[inline]
     fn to_ne_bytes(self) -> [u8; 32] {
-        unsafe { std::mem::transmute(self) }
+        // SAFETY: [u32; 8] and [u8; 32] have the same size and neither has invalid bit patterns.
+        unsafe { std::mem::transmute(self.0) }
     }
 
     #[inline]
@@ -180,9 +181,10 @@ impl std::ops::IndexMut<usize> for Block {
     }
 }
 
-/// A split block Bloom filter. The creation of this structure is based on the
-/// [`crate::file::properties::BloomFilterProperties`] struct set via [`crate::file::properties::WriterProperties`] and
-/// is thus hidden by default.
+/// A split block Bloom filter.
+///
+/// The creation of this structure is based on the [`crate::file::properties::BloomFilterProperties`]
+/// struct set via [`crate::file::properties::WriterProperties`] and is thus hidden by default.
 #[derive(Debug, Clone)]
 pub struct Sbbf(Vec<Block>);
 
@@ -383,6 +385,11 @@ impl Sbbf {
         let block_index = self.hash_to_block_index(hash);
         self.0[block_index].check(hash as u32)
     }
+
+    /// Return the total in memory size of this bloom filter in bytes
+    pub(crate) fn estimated_memory_size(&self) -> usize {
+        self.0.capacity() * std::mem::size_of::<Block>()
+    }
 }
 
 // per spec we use xxHash with seed=0
@@ -408,7 +415,7 @@ mod tests {
     fn test_mask_set_quick_check() {
         for i in 0..1_000_000 {
             let result = Block::mask(i);
-            assert!(result.0.iter().all(|&x| x.count_ones() == 1));
+            assert!(result.0.iter().all(|&x| x.is_power_of_two()));
         }
     }
 

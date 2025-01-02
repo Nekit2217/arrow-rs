@@ -43,7 +43,7 @@ use crate::column::writer::{
 };
 use crate::data_type::{ByteArray, FixedLenByteArray};
 use crate::errors::{ParquetError, Result};
-use crate::file::metadata::{ColumnChunkMetaData, KeyValue, RowGroupMetaDataPtr};
+use crate::file::metadata::{KeyValue, RowGroupMetaData};
 use crate::file::properties::{WriterProperties, WriterPropertiesPtr};
 use crate::file::reader::{ChunkReader, Length};
 use crate::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
@@ -84,15 +84,20 @@ mod levels;
 ///
 /// ## Memory Limiting
 ///
-/// The nature of parquet forces buffering of an entire row group before it can be flushed
-/// to the underlying writer. Data is buffered in its encoded form, to reduce memory usage,
-/// but if writing rows containing large strings or very nested data, this may still result in
-/// non-trivial memory usage.
+/// The nature of parquet forces buffering of an entire row group before it can
+/// be flushed to the underlying writer. Data is mostly buffered in its encoded
+/// form, reducing memory usage. However, some data such as dictionary keys or
+/// large strings or very nested data may still result in non-trivial memory
+/// usage.
 ///
-/// [`ArrowWriter::in_progress_size`] can be used to track the size of the buffered row group,
-/// and potentially trigger an early flush of a row group based on a memory threshold and/or
-/// global memory pressure. However, users should be aware that smaller row groups will result
-/// in higher metadata overheads, and may worsen compression ratios and query performance.
+/// See Also:
+/// * [`ArrowWriter::memory_size`]: the current memory usage of the writer.
+/// * [`ArrowWriter::in_progress_size`]: Estimated size of the buffered row group,
+///
+/// Call [`Self::flush`] to trigger an early flush of a row group based on a
+/// memory threshold and/or global memory pressure. However,  smaller row groups
+/// result in higher metadata overheads, and thus may worsen compression ratios
+/// and query performance.
 ///
 /// ```no_run
 /// # use std::io::Write;
@@ -101,7 +106,7 @@ mod levels;
 /// # let mut writer: ArrowWriter<Vec<u8>> = todo!();
 /// # let batch: RecordBatch = todo!();
 /// writer.write(&batch).unwrap();
-/// // Trigger an early flush if buffered size exceeds 1_000_000
+/// // Trigger an early flush if anticipated size exceeds 1_000_000
 /// if writer.in_progress_size() > 1_000_000 {
 ///     writer.flush().unwrap();
 /// }
@@ -199,11 +204,27 @@ impl<W: Write + Send> ArrowWriter<W> {
     }
 
     /// Returns metadata for any flushed row groups
-    pub fn flushed_row_groups(&self) -> &[RowGroupMetaDataPtr] {
+    pub fn flushed_row_groups(&self) -> &[RowGroupMetaData] {
         self.writer.flushed_row_groups()
     }
 
-    /// Returns the estimated length in bytes of the current in progress row group
+    /// Estimated memory usage, in bytes, of this `ArrowWriter`
+    ///
+    /// This estimate is formed bu summing the values of
+    /// [`ArrowColumnWriter::memory_size`] all in progress columns.
+    pub fn memory_size(&self) -> usize {
+        match &self.in_progress {
+            Some(in_progress) => in_progress.writers.iter().map(|x| x.memory_size()).sum(),
+            None => 0,
+        }
+    }
+
+    /// Anticipated encoded size of the in progress row group.
+    ///
+    /// This estimate the row group size after being completely encoded is,
+    /// formed by summing the values of
+    /// [`ArrowColumnWriter::get_estimated_total_bytes`] for all in progress
+    /// columns.
     pub fn in_progress_size(&self) -> usize {
         match &self.in_progress {
             Some(in_progress) => in_progress
@@ -468,11 +489,6 @@ impl PageWriter for ArrowPageWriter {
         Ok(spec)
     }
 
-    fn write_metadata(&mut self, _metadata: &ColumnChunkMetaData) -> Result<()> {
-        // Skip writing metadata as won't be copied anyway
-        Ok(())
-    }
-
     fn close(&mut self) -> Result<()> {
         Ok(())
     }
@@ -629,7 +645,30 @@ impl ArrowColumnWriter {
         Ok(ArrowColumnChunk { data, close })
     }
 
-    /// Returns the estimated total bytes for this column writer
+    /// Returns the estimated total memory usage by the writer.
+    ///
+    /// This  [`Self::get_estimated_total_bytes`] this is an estimate
+    /// of the current memory usage and not it's anticipated encoded size.
+    ///
+    /// This includes:
+    /// 1. Data buffered in encoded form
+    /// 2. Data buffered in un-encoded form (e.g. `usize` dictionary keys)
+    ///
+    /// This value should be greater than or equal to [`Self::get_estimated_total_bytes`]
+    pub fn memory_size(&self) -> usize {
+        match &self.writer {
+            ArrowColumnWriterImpl::ByteArray(c) => c.memory_size(),
+            ArrowColumnWriterImpl::Column(c) => c.memory_size(),
+        }
+    }
+
+    /// Returns the estimated total encoded bytes for this column writer.
+    ///
+    /// This includes:
+    /// 1. Data buffered in encoded form
+    /// 2. An estimate of how large the data buffered in un-encoded form would be once encoded
+    ///
+    /// This value should be less than or equal to [`Self::memory_size`]
     pub fn get_estimated_total_bytes(&self) -> usize {
         match &self.writer {
             ArrowColumnWriterImpl::ByteArray(c) => c.get_estimated_total_bytes() as _,
@@ -1052,8 +1091,10 @@ mod tests {
     use crate::data_type::AsBytes;
     use crate::file::metadata::ParquetMetaData;
     use crate::file::page_index::index::Index;
-    use crate::file::page_index::index_reader::read_pages_locations;
-    use crate::file::properties::{EnabledStatistics, ReaderProperties, WriterVersion};
+    use crate::file::page_index::index_reader::read_offset_indexes;
+    use crate::file::properties::{
+        BloomFilterPosition, EnabledStatistics, ReaderProperties, WriterVersion,
+    };
     use crate::file::serialized_reader::ReadOptionsBuilder;
     use crate::file::{
         reader::{FileReader, SerializedFileReader},
@@ -1162,7 +1203,7 @@ mod tests {
 
         // Construct a buffer for value offsets, for the nested array:
         //  [[1], [2, 3], null, [4, 5, 6], [7, 8, 9, 10]]
-        let a_value_offsets = arrow::buffer::Buffer::from(&[0, 1, 3, 3, 6, 10].to_byte_slice());
+        let a_value_offsets = arrow::buffer::Buffer::from([0, 1, 3, 3, 6, 10].to_byte_slice());
 
         // Construct a list array from the above two
         let a_list_data = ArrayData::builder(DataType::List(Arc::new(Field::new(
@@ -1173,7 +1214,7 @@ mod tests {
         .len(5)
         .add_buffer(a_value_offsets)
         .add_child_data(a_values.into_data())
-        .null_bit_buffer(Some(Buffer::from(vec![0b00011011])))
+        .null_bit_buffer(Some(Buffer::from([0b00011011])))
         .build()
         .unwrap();
         let a = ListArray::from(a_list_data);
@@ -1202,7 +1243,7 @@ mod tests {
 
         // Construct a buffer for value offsets, for the nested array:
         //  [[1], [2, 3], [], [4, 5, 6], [7, 8, 9, 10]]
-        let a_value_offsets = arrow::buffer::Buffer::from(&[0, 1, 3, 3, 6, 10].to_byte_slice());
+        let a_value_offsets = arrow::buffer::Buffer::from([0, 1, 3, 3, 6, 10].to_byte_slice());
 
         // Construct a list array from the above two
         let a_list_data = ArrayData::builder(DataType::List(Arc::new(Field::new(
@@ -1361,7 +1402,7 @@ mod tests {
 
         // Construct a buffer for value offsets, for the nested array:
         //  [[1], [2, 3], [], [4, 5, 6], [7, 8, 9, 10]]
-        let g_value_offsets = arrow::buffer::Buffer::from(&[0, 1, 3, 3, 6, 10].to_byte_slice());
+        let g_value_offsets = arrow::buffer::Buffer::from([0, 1, 3, 3, 6, 10].to_byte_slice());
 
         // Construct a list array from the above two
         let g_list_data = ArrayData::builder(struct_field_g.data_type().clone())
@@ -1376,7 +1417,7 @@ mod tests {
             .len(5)
             .add_buffer(g_value_offsets)
             .add_child_data(g_value.to_data())
-            .null_bit_buffer(Some(Buffer::from(vec![0b00011011])))
+            .null_bit_buffer(Some(Buffer::from([0b00011011])))
             .build()
             .unwrap();
         let h = ListArray::from(h_list_data);
@@ -1481,14 +1522,14 @@ mod tests {
         let c = Int32Array::from(vec![Some(1), None, Some(3), None, None, Some(6)]);
         let b_data = ArrayDataBuilder::new(field_b.data_type().clone())
             .len(6)
-            .null_bit_buffer(Some(Buffer::from(vec![0b00100111])))
+            .null_bit_buffer(Some(Buffer::from([0b00100111])))
             .add_child_data(c.into_data())
             .build()
             .unwrap();
         let b = StructArray::from(b_data);
         let a_data = ArrayDataBuilder::new(field_a.data_type().clone())
             .len(6)
-            .null_bit_buffer(Some(Buffer::from(vec![0b00101111])))
+            .null_bit_buffer(Some(Buffer::from([0b00101111])))
             .add_child_data(b.into_data())
             .build()
             .unwrap();
@@ -1551,7 +1592,7 @@ mod tests {
         let c = Int32Array::from(vec![1, 2, 3, 4, 5, 6]);
         let b_data = ArrayDataBuilder::new(type_b)
             .len(6)
-            .null_bit_buffer(Some(Buffer::from(vec![0b00100111])))
+            .null_bit_buffer(Some(Buffer::from([0b00100111])))
             .add_child_data(c.into_data())
             .build()
             .unwrap();
@@ -1573,6 +1614,85 @@ mod tests {
         roundtrip(batch, Some(SMALL_SIZE / 2));
     }
 
+    #[test]
+    fn arrow_writer_2_level_struct_mixed_null_2() {
+        // tests writing <struct<struct<primitive>>, where the primitive columns are non-null.
+        let field_c = Field::new("c", DataType::Int32, false);
+        let field_d = Field::new("d", DataType::FixedSizeBinary(4), false);
+        let field_e = Field::new(
+            "e",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        );
+
+        let field_b = Field::new(
+            "b",
+            DataType::Struct(vec![field_c, field_d, field_e].into()),
+            false,
+        );
+        let type_a = DataType::Struct(vec![field_b.clone()].into());
+        let field_a = Field::new("a", type_a, true);
+        let schema = Schema::new(vec![field_a.clone()]);
+
+        // create data
+        let c = Int32Array::from_iter_values(0..6);
+        let d = FixedSizeBinaryArray::try_from_iter(
+            ["aaaa", "bbbb", "cccc", "dddd", "eeee", "ffff"].into_iter(),
+        )
+        .expect("four byte values");
+        let e = Int32DictionaryArray::from_iter(["one", "two", "three", "four", "five", "one"]);
+        let b_data = ArrayDataBuilder::new(field_b.data_type().clone())
+            .len(6)
+            .add_child_data(c.into_data())
+            .add_child_data(d.into_data())
+            .add_child_data(e.into_data())
+            .build()
+            .unwrap();
+        let b = StructArray::from(b_data);
+        let a_data = ArrayDataBuilder::new(field_a.data_type().clone())
+            .len(6)
+            .null_bit_buffer(Some(Buffer::from([0b00100101])))
+            .add_child_data(b.into_data())
+            .build()
+            .unwrap();
+        let a = StructArray::from(a_data);
+
+        assert_eq!(a.null_count(), 3);
+        assert_eq!(a.column(0).null_count(), 0);
+
+        // build a record batch
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).unwrap();
+
+        roundtrip(batch, Some(SMALL_SIZE / 2));
+    }
+
+    #[test]
+    fn test_empty_dict() {
+        let struct_fields = Fields::from(vec![Field::new(
+            "dict",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]);
+
+        let schema = Schema::new(vec![Field::new_struct(
+            "struct",
+            struct_fields.clone(),
+            true,
+        )]);
+        let dictionary = Arc::new(DictionaryArray::new(
+            Int32Array::new_null(5),
+            Arc::new(StringArray::new_null(0)),
+        ));
+
+        let s = StructArray::new(
+            struct_fields,
+            vec![dictionary],
+            Some(NullBuffer::new_null(5)),
+        );
+
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(s)]).unwrap();
+        roundtrip(batch, None);
+    }
     #[test]
     fn arrow_writer_page_size() {
         let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
@@ -1623,16 +1743,16 @@ mod tests {
             "Expected a dictionary page"
         );
 
-        let page_locations = read_pages_locations(&file, column).unwrap();
+        let offset_indexes = read_offset_indexes(&file, column).unwrap();
 
-        let offset_index = page_locations[0].clone();
+        let page_locations = offset_indexes[0].page_locations.clone();
 
         // We should fallback to PLAIN encoding after the first row and our max page size is 1 bytes
         // so we expect one dictionary encoded page and then a page per row thereafter.
         assert_eq!(
-            offset_index.len(),
+            page_locations.len(),
             10,
-            "Expected 9 pages but got {offset_index:#?}"
+            "Expected 9 pages but got {page_locations:#?}"
         );
     }
 
@@ -1694,13 +1814,18 @@ mod tests {
     }
 
     fn roundtrip_opts(expected_batch: &RecordBatch, props: WriterProperties) -> File {
-        roundtrip_opts_with_array_validation(expected_batch, props, |a, b| assert_eq!(a, b))
+        roundtrip_opts_with_array_validation(expected_batch, props, |a, b| {
+            a.validate_full().expect("valid expected data");
+            b.validate_full().expect("valid actual data");
+            assert_eq!(a, b)
+        })
     }
 
     struct RoundTripOptions {
         values: ArrayRef,
         schema: SchemaRef,
         bloom_filter: bool,
+        bloom_filter_position: BloomFilterPosition,
     }
 
     impl RoundTripOptions {
@@ -1711,6 +1836,7 @@ mod tests {
                 values,
                 schema: Arc::new(schema),
                 bloom_filter: false,
+                bloom_filter_position: BloomFilterPosition::AfterRowGroup,
             }
         }
     }
@@ -1730,6 +1856,7 @@ mod tests {
             values,
             schema,
             bloom_filter,
+            bloom_filter_position,
         } = options;
 
         let encodings = match values.data_type() {
@@ -1747,7 +1874,11 @@ mod tests {
             | DataType::UInt64
             | DataType::UInt32
             | DataType::UInt16
-            | DataType::UInt8 => vec![Encoding::PLAIN, Encoding::DELTA_BINARY_PACKED],
+            | DataType::UInt8 => vec![
+                Encoding::PLAIN,
+                Encoding::DELTA_BINARY_PACKED,
+                Encoding::BYTE_STREAM_SPLIT,
+            ],
             DataType::Float32 | DataType::Float64 => {
                 vec![Encoding::PLAIN, Encoding::BYTE_STREAM_SPLIT]
             }
@@ -1770,6 +1901,7 @@ mod tests {
                             .set_dictionary_page_size_limit(dictionary_size.max(1))
                             .set_encoding(*encoding)
                             .set_bloom_filter_enabled(bloom_filter)
+                            .set_bloom_filter_position(bloom_filter_position)
                             .build();
 
                         files.push(roundtrip_opts(&expected_batch, props))
@@ -2128,6 +2260,22 @@ mod tests {
     }
 
     #[test]
+    fn i32_column_bloom_filter_at_end() {
+        let array = Arc::new(Int32Array::from_iter(0..SMALL_SIZE as i32));
+        let mut options = RoundTripOptions::new(array, false);
+        options.bloom_filter = true;
+        options.bloom_filter_position = BloomFilterPosition::End;
+
+        let files = one_column_roundtrip_with_options(options);
+        check_bloom_filter(
+            files,
+            "col".to_string(),
+            (0..SMALL_SIZE as i32).collect(),
+            (SMALL_SIZE as i32 + 1..SMALL_SIZE as i32 + 10).collect(),
+        );
+    }
+
+    #[test]
     fn i32_column_bloom_filter() {
         let array = Arc::new(Int32Array::from_iter(0..SMALL_SIZE as i32));
         let mut options = RoundTripOptions::new(array, false);
@@ -2236,7 +2384,7 @@ mod tests {
 
         // Build [[], null, [null, null]]
         let a_values = NullArray::new(2);
-        let a_value_offsets = arrow::buffer::Buffer::from(&[0, 0, 0, 2].to_byte_slice());
+        let a_value_offsets = arrow::buffer::Buffer::from([0, 0, 0, 2].to_byte_slice());
         let a_list_data = ArrayData::builder(DataType::List(Arc::new(Field::new(
             "item",
             DataType::Null,
@@ -2244,7 +2392,7 @@ mod tests {
         ))))
         .len(3)
         .add_buffer(a_value_offsets)
-        .null_bit_buffer(Some(Buffer::from(vec![0b00000101])))
+        .null_bit_buffer(Some(Buffer::from([0b00000101])))
         .add_child_data(a_values.into_data())
         .build()
         .unwrap();
@@ -2266,7 +2414,7 @@ mod tests {
     #[test]
     fn list_single_column() {
         let a_values = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        let a_value_offsets = arrow::buffer::Buffer::from(&[0, 1, 3, 3, 6, 10].to_byte_slice());
+        let a_value_offsets = arrow::buffer::Buffer::from([0, 1, 3, 3, 6, 10].to_byte_slice());
         let a_list_data = ArrayData::builder(DataType::List(Arc::new(Field::new(
             "item",
             DataType::Int32,
@@ -2274,7 +2422,7 @@ mod tests {
         ))))
         .len(5)
         .add_buffer(a_value_offsets)
-        .null_bit_buffer(Some(Buffer::from(vec![0b00011011])))
+        .null_bit_buffer(Some(Buffer::from([0b00011011])))
         .add_child_data(a_values.into_data())
         .build()
         .unwrap();
@@ -2290,7 +2438,7 @@ mod tests {
     #[test]
     fn large_list_single_column() {
         let a_values = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-        let a_value_offsets = arrow::buffer::Buffer::from(&[0i64, 1, 3, 3, 6, 10].to_byte_slice());
+        let a_value_offsets = arrow::buffer::Buffer::from([0i64, 1, 3, 3, 6, 10].to_byte_slice());
         let a_list_data = ArrayData::builder(DataType::LargeList(Arc::new(Field::new(
             "large_item",
             DataType::Int32,
@@ -2299,7 +2447,7 @@ mod tests {
         .len(5)
         .add_buffer(a_value_offsets)
         .add_child_data(a_values.into_data())
-        .null_bit_buffer(Some(Buffer::from(vec![0b00011011])))
+        .null_bit_buffer(Some(Buffer::from([0b00011011])))
         .build()
         .unwrap();
 
@@ -2476,10 +2624,15 @@ mod tests {
                 row_offset += column.num_values() as usize;
 
                 let stats = column.statistics().unwrap();
-                assert!(stats.has_min_max_set());
                 if let Statistics::Int32(stats) = stats {
-                    assert_eq!(*stats.min() as u32, *src_slice.iter().min().unwrap());
-                    assert_eq!(*stats.max() as u32, *src_slice.iter().max().unwrap());
+                    assert_eq!(
+                        *stats.min_opt().unwrap() as u32,
+                        *src_slice.iter().min().unwrap()
+                    );
+                    assert_eq!(
+                        *stats.max_opt().unwrap() as u32,
+                        *src_slice.iter().max().unwrap()
+                    );
                 } else {
                     panic!("Statistics::Int32 missing")
                 }
@@ -2517,10 +2670,15 @@ mod tests {
                 row_offset += column.num_values() as usize;
 
                 let stats = column.statistics().unwrap();
-                assert!(stats.has_min_max_set());
                 if let Statistics::Int64(stats) = stats {
-                    assert_eq!(*stats.min() as u64, *src_slice.iter().min().unwrap());
-                    assert_eq!(*stats.max() as u64, *src_slice.iter().max().unwrap());
+                    assert_eq!(
+                        *stats.min_opt().unwrap() as u64,
+                        *src_slice.iter().min().unwrap()
+                    );
+                    assert_eq!(
+                        *stats.max_opt().unwrap() as u64,
+                        *src_slice.iter().max().unwrap()
+                    );
                 } else {
                     panic!("Statistics::Int64 missing")
                 }
@@ -2543,7 +2701,7 @@ mod tests {
             assert_eq!(row_group.num_columns(), 1);
             let column = row_group.column(0);
             let stats = column.statistics().unwrap();
-            assert_eq!(stats.null_count(), 2);
+            assert_eq!(stats.null_count_opt(), Some(2));
         }
     }
 
@@ -2894,6 +3052,7 @@ mod tests {
         // starts empty
         assert_eq!(writer.in_progress_size(), 0);
         assert_eq!(writer.in_progress_rows(), 0);
+        assert_eq!(writer.memory_size(), 0);
         assert_eq!(writer.bytes_written(), 4); // Initial header
         writer.write(&batch).unwrap();
 
@@ -2901,17 +3060,31 @@ mod tests {
         let initial_size = writer.in_progress_size();
         assert!(initial_size > 0);
         assert_eq!(writer.in_progress_rows(), 5);
+        let initial_memory = writer.memory_size();
+        assert!(initial_memory > 0);
+        // memory estimate is larger than estimated encoded size
+        assert!(
+            initial_size <= initial_memory,
+            "{initial_size} <= {initial_memory}"
+        );
 
         // updated on second write
         writer.write(&batch).unwrap();
         assert!(writer.in_progress_size() > initial_size);
         assert_eq!(writer.in_progress_rows(), 10);
+        assert!(writer.memory_size() > initial_memory);
+        assert!(
+            writer.in_progress_size() <= writer.memory_size(),
+            "in_progress_size {} <= memory_size {}",
+            writer.in_progress_size(),
+            writer.memory_size()
+        );
 
         // in progress tracking is cleared, but the overall data written is updated
         let pre_flush_bytes_written = writer.bytes_written();
         writer.flush().unwrap();
         assert_eq!(writer.in_progress_size(), 0);
-        assert_eq!(writer.in_progress_rows(), 0);
+        assert_eq!(writer.memory_size(), 0);
         assert!(writer.bytes_written() > pre_flush_bytes_written);
 
         writer.close().unwrap();
@@ -2939,8 +3112,8 @@ mod tests {
 
         assert_eq!(index.len(), 1);
         assert_eq!(index[0].len(), 2); // 2 columns
-        assert_eq!(index[0][0].len(), 1); // 1 page
-        assert_eq!(index[0][1].len(), 1); // 1 page
+        assert_eq!(index[0][0].page_locations().len(), 1); // 1 page
+        assert_eq!(index[0][1].page_locations().len(), 1); // 1 page
     }
 
     #[test]
@@ -2989,11 +3162,11 @@ mod tests {
 
         // Column chunk of column "a" should have chunk level statistics
         if let Statistics::ByteArray(byte_array_stats) = a_col.statistics().unwrap() {
-            let min = byte_array_stats.min();
-            let max = byte_array_stats.max();
+            let min = byte_array_stats.min_opt().unwrap();
+            let max = byte_array_stats.max_opt().unwrap();
 
-            assert_eq!(min.as_bytes(), &[b'a']);
-            assert_eq!(max.as_bytes(), &[b'd']);
+            assert_eq!(min.as_bytes(), b"a");
+            assert_eq!(max.as_bytes(), b"d");
         } else {
             panic!("expecting Statistics::ByteArray");
         }
@@ -3061,11 +3234,11 @@ mod tests {
 
         // Column chunk of column "a" should have chunk level statistics
         if let Statistics::ByteArray(byte_array_stats) = a_col.statistics().unwrap() {
-            let min = byte_array_stats.min();
-            let max = byte_array_stats.max();
+            let min = byte_array_stats.min_opt().unwrap();
+            let max = byte_array_stats.max_opt().unwrap();
 
-            assert_eq!(min.as_bytes(), &[b'a']);
-            assert_eq!(max.as_bytes(), &[b'd']);
+            assert_eq!(min.as_bytes(), b"a");
+            assert_eq!(max.as_bytes(), b"d");
         } else {
             panic!("expecting Statistics::ByteArray");
         }

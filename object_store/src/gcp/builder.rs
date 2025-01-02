@@ -30,9 +30,12 @@ use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use url::Url;
 
 use super::credential::{AuthorizedUserSigningCredentials, InstanceSigningCredentialProvider};
+
+const TOKEN_MIN_TTL: Duration = Duration::from_secs(4 * 60);
 
 #[derive(Debug, Snafu)]
 enum Error {
@@ -185,7 +188,7 @@ impl FromStr for GoogleConfigKey {
             "google_service_account_key" | "service_account_key" => Ok(Self::ServiceAccountKey),
             "google_bucket" | "google_bucket_name" | "bucket" | "bucket_name" => Ok(Self::Bucket),
             "google_application_credentials" => Ok(Self::ApplicationCredentials),
-            _ => match s.parse() {
+            _ => match s.strip_prefix("google_").unwrap_or(s).parse() {
                 Ok(key) => Ok(Self::Client(key)),
                 Err(_) => Err(Error::UnknownConfigurationKey { key: s.into() }.into()),
             },
@@ -463,13 +466,14 @@ impl GoogleCloudStorageBuilder {
             )) as _
         } else if let Some(credentials) = application_default_credentials.clone() {
             match credentials {
-                ApplicationDefaultCredentials::AuthorizedUser(token) => {
-                    Arc::new(TokenCredentialProvider::new(
+                ApplicationDefaultCredentials::AuthorizedUser(token) => Arc::new(
+                    TokenCredentialProvider::new(
                         token,
                         self.client_options.client()?,
                         self.retry_config.clone(),
-                    )) as _
-                }
+                    )
+                    .with_min_ttl(TOKEN_MIN_TTL),
+                ) as _,
                 ApplicationDefaultCredentials::ServiceAccount(token) => {
                     Arc::new(TokenCredentialProvider::new(
                         token.token_provider()?,
@@ -479,11 +483,14 @@ impl GoogleCloudStorageBuilder {
                 }
             }
         } else {
-            Arc::new(TokenCredentialProvider::new(
-                InstanceCredentialProvider::default(),
-                self.client_options.metadata_client()?,
-                self.retry_config.clone(),
-            )) as _
+            Arc::new(
+                TokenCredentialProvider::new(
+                    InstanceCredentialProvider::default(),
+                    self.client_options.metadata_client()?,
+                    self.retry_config.clone(),
+                )
+                .with_min_ttl(TOKEN_MIN_TTL),
+            ) as _
         };
 
         let signing_credentials = if let Some(signing_credentials) = self.signing_credentials {
@@ -670,5 +677,18 @@ mod tests {
             builder.get_config_value(&GoogleConfigKey::Bucket).unwrap(),
             google_bucket_name
         );
+    }
+
+    #[test]
+    fn gcp_test_client_opts() {
+        let key = "GOOGLE_PROXY_URL";
+        if let Ok(config_key) = key.to_ascii_lowercase().parse() {
+            assert_eq!(
+                GoogleConfigKey::Client(ClientConfigKey::ProxyUrl),
+                config_key
+            );
+        } else {
+            panic!("{} not propagated as ClientConfigKey", key);
+        }
     }
 }

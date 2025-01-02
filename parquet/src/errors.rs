@@ -42,6 +42,8 @@ pub enum ParquetError {
     /// Arrow error.
     /// Returned when reading into arrow or writing from arrow.
     ArrowError(String),
+    /// Error when the requested column index is more than the
+    /// number of columns in the row group
     IndexOutOfBound(usize, usize),
     /// An external error variant
     External(Box<dyn Error + Send + Sync>),
@@ -104,7 +106,6 @@ impl From<str::Utf8Error> for ParquetError {
         ParquetError::External(Box::new(e))
     }
 }
-
 #[cfg(feature = "arrow")]
 impl From<ArrowError> for ParquetError {
     fn from(e: ArrowError) -> ParquetError {
