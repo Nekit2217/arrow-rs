@@ -26,6 +26,7 @@ use arrow_schema::ArrowError;
 use chrono::prelude::*;
 use half::f16;
 use std::str::FromStr;
+use chrono::ParseResult;
 
 /// Parse nanoseconds from the first `N` values in digits, subtracting the offset `O`
 #[inline]
@@ -180,6 +181,17 @@ pub fn string_to_datetime<T: TimeZone>(timezone: &T, s: &str) -> Result<DateTime
     let bytes = s.as_bytes();
     if bytes.len() < 10 {
         return Err(err("timestamp must contain at least 10 characters"));
+    }
+
+    if s.starts_with("-") | s.starts_with("+") {
+        let chrono = match NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+            Ok(nd) => { nd }
+            Err(e) => { println!("{:?}", e); return Err(err("failed workaround timestamp"));}
+        };
+        let datetime = DateTime::from_timestamp_nanos(chrono.and_utc().timestamp_micros());
+        let datetime_utc: DateTime<Utc> = DateTime::from_naive_utc_and_offset(datetime.naive_utc(), Utc);
+        let datetime_in_timezone = datetime_utc.with_timezone(timezone);
+        return Ok(datetime_in_timezone)
     }
 
     let parser = TimestampParser::new(bytes);
@@ -1644,6 +1656,7 @@ mod tests {
     #[test]
     fn string_to_timestamp_naive() {
         let cases = [
+            "+56991-09-18T08:32:04",
             "2018-11-13T17:11:10.011375885995",
             "2030-12-04T17:11:10.123",
             "2030-12-04T17:11:10.1234",
