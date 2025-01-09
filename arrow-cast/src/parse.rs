@@ -184,7 +184,7 @@ pub fn string_to_datetime<T: TimeZone>(timezone: &T, s: &str) -> Result<DateTime
     }
 
     if s.starts_with("-") | s.starts_with("+") {
-        let chrono = match NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        let chrono = match NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ") {
             Ok(nd) => { nd }
             Err(e) => { println!("{:?}", e); return Err(err("failed workaround timestamp"));}
         };
@@ -1656,14 +1656,14 @@ mod tests {
     #[test]
     fn string_to_timestamp_naive() {
         let cases = [
-            "+56991-09-18T08:32:04",
+            "+56991-09-18T08:32:04.000Z",
             "2018-11-13T17:11:10.011375885995",
             "2030-12-04T17:11:10.123",
             "2030-12-04T17:11:10.1234",
             "2030-12-04T17:11:10.123456",
         ];
         for case in cases {
-            let chrono = NaiveDateTime::parse_from_str(case, "%Y-%m-%dT%H:%M:%S%.f").unwrap();
+            let chrono = NaiveDateTime::parse_from_str(case, "%Y-%m-%dT%H:%M:%S%.fZ").unwrap();
             let custom = string_to_datetime(&Utc, case).unwrap();
             assert_eq!(chrono, custom.naive_utc())
         }
