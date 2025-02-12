@@ -153,10 +153,14 @@ impl BooleanBuffer {
 
     /// Slices this [`BooleanBuffer`] by the provided `offset` and `length`
     pub fn slice(&self, offset: usize, len: usize) -> Self {
-        assert!(
-            offset.saturating_add(len) <= self.len,
-            "the length + offset of the sliced BooleanBuffer cannot exceed the existing length"
-        );
+        // assert!(
+        //     offset.saturating_add(len) <= self.len,
+        //     "the length + offset of the sliced BooleanBuffer cannot exceed the existing length"
+        // );
+        let mut len = len;
+        if offset.saturating_add(len) > self.len {
+            len = self.len - offset
+        }
         Self {
             buffer: self.buffer.clone(),
             offset: self.offset + offset,

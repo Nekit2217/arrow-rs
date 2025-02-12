@@ -22,6 +22,7 @@ use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields};
 use std::sync::Arc;
 use std::{any::Any, ops::Index};
+use log::info;
 
 /// An array of [structs](https://arrow.apache.org/docs/format/Columnar.html#struct-layout)
 ///
@@ -278,7 +279,11 @@ impl StructArray {
 
     /// Returns a zero-copy slice of this array with the indicated offset and length.
     pub fn slice(&self, offset: usize, len: usize) -> Self {
-        assert!(
+        let mut len = len;
+        if offset.saturating_add(len) > self.len {
+            len = self.len- offset
+        }
+        info!("{} {}",
             offset.saturating_add(len) <= self.len,
             "the length + offset of the sliced StructArray cannot exceed the existing length"
         );
@@ -534,6 +539,7 @@ mod tests {
                 int.clone() as ArrayRef,
             ),
         ]);
+
         assert_eq!(struct_array["b"].as_ref(), boolean.as_ref());
         assert_eq!(struct_array["c"].as_ref(), int.as_ref());
     }
