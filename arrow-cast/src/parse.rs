@@ -893,7 +893,7 @@ pub fn parse_decimal<T: DecimalType>(
                 for (_, b) in bs.by_ref() {
                     if !b.is_ascii_digit() {
                         if *b == b'e' || *b == b'E' {
-                            result = match parse_e_notation::<T>(
+                            result = parse_e_notation::<T>(
                                 s,
                                 digits as u16,
                                 fractionals as i16,
@@ -901,10 +901,7 @@ pub fn parse_decimal<T: DecimalType>(
                                 point_index,
                                 precision as u16,
                                 scale as i16,
-                            ) {
-                                Err(e) => return Err(e),
-                                Ok(v) => v,
-                            };
+                            )?;
 
                             is_e_notation = true;
 
@@ -938,7 +935,7 @@ pub fn parse_decimal<T: DecimalType>(
                 }
             }
             b'e' | b'E' => {
-                result = match parse_e_notation::<T>(
+                result = parse_e_notation::<T>(
                     s,
                     digits as u16,
                     fractionals as i16,
@@ -946,10 +943,7 @@ pub fn parse_decimal<T: DecimalType>(
                     index,
                     precision as u16,
                     scale as i16,
-                ) {
-                    Err(e) => return Err(e),
-                    Ok(v) => v,
-                };
+                )?;
 
                 is_e_notation = true;
 

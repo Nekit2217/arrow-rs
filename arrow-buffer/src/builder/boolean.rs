@@ -19,6 +19,12 @@ use crate::{bit_mask, bit_util, BooleanBuffer, Buffer, MutableBuffer};
 use std::ops::Range;
 
 /// Builder for [`BooleanBuffer`]
+///
+/// # See Also
+///
+/// * [`NullBuffer`] for building [`BooleanBuffer`]s for representing nulls
+///
+/// [`NullBuffer`]: crate::NullBuffer
 #[derive(Debug)]
 pub struct BooleanBufferBuilder {
     buffer: MutableBuffer,
@@ -26,7 +32,11 @@ pub struct BooleanBufferBuilder {
 }
 
 impl BooleanBufferBuilder {
-    /// Creates a new `BooleanBufferBuilder`
+    /// Creates a new `BooleanBufferBuilder` with sufficient space for
+    /// `capacity` bits (not bytes).
+    ///
+    /// The capacity is rounded up to the nearest multiple of 8 for the
+    /// allocation.
     #[inline]
     pub fn new(capacity: usize) -> Self {
         let byte_capacity = bit_util::ceil(capacity, 8);
